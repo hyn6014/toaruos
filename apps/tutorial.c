@@ -6,6 +6,8 @@
  * tutorial - A recreation of the original wizard.py, explaining
  *            the functionality of ToaruOS and how to use the WM.
  */
+#include <time.h>
+
 #include <toaru/yutani.h>
 #include <toaru/graphics.h>
 #include <toaru/decorations.h>
@@ -129,6 +131,18 @@ static void circle(int x, int y, int r) {
 	invert_background_alpha();
 }
 
+static char * randomly_select_begging(void) {
+	char * options[] = {
+		"You can help support ToaruOS by donating:",
+		"Your donation helps us continue developing ToaruOS:",
+		"You can sponsor ToaruOS development on Github:",
+		"Please give me money:",
+	};
+
+	return options[rand() % (sizeof(options) / sizeof(*options))];
+
+}
+
 static void load_page(int page) {
 
 	int i = 0;
@@ -152,6 +166,9 @@ static void load_page(int page) {
 			body_text[i++] = "";
 			body_text[i++] = "ToaruOS is free software, released under the terms of the";
 			body_text[i++] = "NCSA/University of Illinois license.";
+			body_text[i++] = "";
+			body_text[i++] = randomly_select_begging();
+			body_text[i++] = "%https://github.com/sponsors/klange";
 			body_text[i++] = NULL;
 			break;
 		case 1:
@@ -162,6 +179,9 @@ static void load_page(int page) {
 			body_text[i++] = "may be missing, incomplete, or unstable. Contributions in the form";
 			body_text[i++] = "of bug-fixes and new software are welcome. You can join our community";
 			body_text[i++] = "through IRC by joining the #toaruos channel on Freenode.";
+			body_text[i++] = "";
+			body_text[i++] = "You can help support ToaruOS by donating:";
+			body_text[i++] = "%https://github.com/sponsors/klange";
 			body_text[i++] = NULL;
 			break;
 		case 2:
@@ -282,6 +302,7 @@ void set_hilight(struct TTKButton * button, int hilight) {
 
 
 int main(int argc, char * argv[]) {
+	srand(time(NULL));
 	int req_center_x, req_center_y;
 	yctx = yutani_init();
 	if (!yctx) {
@@ -306,20 +327,11 @@ int main(int argc, char * argv[]) {
 	window = yutani_window_create(yctx, width + bounds.width, height + bounds.height);
 
 	/* Load icons */
-	load_sprite(&logo, "/usr/share/logo_login.bmp");
-	logo.alpha = ALPHA_EMBEDDED;
-
-	load_sprite(&terminal, "/usr/share/icons/48/utilities-terminal.bmp");
-	terminal.alpha = ALPHA_EMBEDDED;
-
-	load_sprite(&folder, "/usr/share/icons/48/folder.bmp");
-	folder.alpha = ALPHA_EMBEDDED;
-
-	load_sprite(&package, "/usr/share/icons/48/package.bmp");
-	package.alpha = ALPHA_EMBEDDED;
-
-	load_sprite(&mouse_drag, "/usr/share/cursor/drag.bmp");
-	mouse_drag.alpha = ALPHA_EMBEDDED;
+	load_sprite(&logo, "/usr/share/logo_login.png");
+	load_sprite(&terminal, "/usr/share/icons/48/utilities-terminal.png");
+	load_sprite(&folder, "/usr/share/icons/48/folder.png");
+	load_sprite(&package, "/usr/share/icons/48/package.png");
+	load_sprite(&mouse_drag, "/usr/share/cursor/drag.png");
 
 	load_page(0);
 

@@ -322,11 +322,15 @@ static void _ansi_put(term_state_t * s, char c) {
 							if (!strcmp(argv[0], "?1049")) {
 								if (callbacks->switch_buffer) callbacks->switch_buffer(1);
 							} else if (!strcmp(argv[0], "?1000")) {
-								s->mouse_on = 1;
+								s->mouse_on |= TERMEMU_MOUSE_ENABLE;
 							} else if (!strcmp(argv[0], "?1002")) {
-								s->mouse_on = 2;
+								s->mouse_on |= TERMEMU_MOUSE_DRAG;
+							} else if (!strcmp(argv[0], "?1006")) {
+								s->mouse_on |= TERMEMU_MOUSE_SGR;
 							} else if (!strcmp(argv[0], "?25")) {
 								callbacks->set_csr_on(1);
+							} else if (!strcmp(argv[0], "?2004")) {
+								s->paste_mode = 1;
 							}
 						}
 						break;
@@ -335,11 +339,15 @@ static void _ansi_put(term_state_t * s, char c) {
 							if (!strcmp(argv[0], "?1049")) {
 								if (callbacks->switch_buffer) callbacks->switch_buffer(0);
 							} else if (!strcmp(argv[0], "?1000")) {
-								s->mouse_on = 0;
+								s->mouse_on &= ~TERMEMU_MOUSE_ENABLE;
 							} else if (!strcmp(argv[0], "?1002")) {
-								s->mouse_on = 0;
+								s->mouse_on &= ~TERMEMU_MOUSE_DRAG;
+							} else if (!strcmp(argv[0],"?1006")) {
+								s->mouse_on &= ~TERMEMU_MOUSE_SGR;
 							} else if (!strcmp(argv[0], "?25")) {
 								callbacks->set_csr_on(0);
+							} else if (!strcmp(argv[0], "?2004")) {
+								s->paste_mode = 0;
 							}
 						}
 						break;
@@ -444,6 +452,24 @@ static void _ansi_put(term_state_t * s, char c) {
 								how_many = atoi(argv[0]);
 							}
 							callbacks->scroll(-how_many);
+						}
+						break;
+					case ANSI_IL:
+						{
+							int how_many = 1;
+							if (argc > 0) {
+								how_many = atoi(argv[0]);
+							}
+							callbacks->insert_delete_lines(how_many);
+						}
+						break;
+					case ANSI_DL:
+						{
+							int how_many = 1;
+							if (argc > 0) {
+								how_many = atoi(argv[0]);
+							}
+							callbacks->insert_delete_lines(-how_many);
 						}
 						break;
 					case 'X':

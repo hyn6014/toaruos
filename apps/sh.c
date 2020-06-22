@@ -117,7 +117,7 @@ void reset_pgrp() {
 }
 
 void shell_install_command(char * name, shell_command_t func, char * desc) {
-	if (shell_commands_len == SHELL_COMMANDS) {
+	if (shell_commands_len == SHELL_COMMANDS-1) {
 		SHELL_COMMANDS *= 2;
 		shell_commands = realloc(shell_commands, sizeof(char *) * SHELL_COMMANDS);
 		shell_pointers = realloc(shell_pointers, sizeof(shell_command_t) * SHELL_COMMANDS);
@@ -127,6 +127,7 @@ void shell_install_command(char * name, shell_command_t func, char * desc) {
 	shell_pointers[shell_commands_len] = func;
 	shell_descript[shell_commands_len] = desc;
 	shell_commands_len++;
+	shell_commands[shell_commands_len] = NULL;
 }
 
 shell_command_t shell_find(char * str) {
@@ -494,7 +495,15 @@ void tab_complete_func(rline_context_t * c) {
 			if (last_slash == tmp) {
 				dirp = opendir("/");
 			} else {
-				dirp = opendir(tmp);
+				char * home;
+				if (*tmp == '~' && (home = getenv("HOME"))) {
+					char * t = malloc(strlen(tmp) + strlen(home) + 4);
+					sprintf(t, "%s%s",home,tmp+1);
+					dirp = opendir(t);
+					free(t);
+				} else {
+					dirp = opendir(tmp);
+				}
 			}
 		} else {
 			dirp = opendir(".");
@@ -512,8 +521,15 @@ void tab_complete_func(rline_context_t * c) {
 					struct stat statbuf;
 					/* stat it */
 					if (last_slash) {
-						char * x = malloc(strlen(tmp) + 1 + strlen(ent->d_name) + 1);
-						sprintf(x,"%s/%s",tmp,ent->d_name);
+						char * x;
+						char * home;
+						if (tmp[0] == '~' && (home = getenv("HOME"))) {
+							x = malloc(strlen(tmp) + 1 + strlen(ent->d_name) + 1 + strlen(home) + 1);
+							snprintf(x, strlen(tmp) + 1 + strlen(ent->d_name) + 1 + strlen(home) + 1, "%s%s/%s",home,tmp+1,ent->d_name);
+						} else {
+							x = malloc(strlen(tmp) + 1 + strlen(ent->d_name) + 1);
+							snprintf(x, strlen(tmp) + 1 + strlen(ent->d_name) + 1, "%s/%s",tmp,ent->d_name);
+						}
 						lstat(x, &statbuf);
 						free(x);
 					} else {

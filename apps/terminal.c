@@ -1,7 +1,7 @@
 /* vim: tabstop=4 shiftwidth=4 noexpandtab
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2013-2018 K. Lange
+ * Copyright (C) 2013-2020 K. Lange
  *
  * Terminal Emulator
  *
@@ -28,6 +28,7 @@
 #include <pty.h>
 #include <wchar.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -513,12 +514,63 @@ static char * copy_selection(void) {
 	return selection_text;
 }
 
+static volatile int input_buffer_lock = 0;
+static int input_buffer_semaphore[2];
+static list_t * input_buffer_queue = NULL;
+struct input_data {
+	size_t len;
+	char data[];
+};
+
+void * handle_input_writing(void * unused) {
+	(void)unused;
+
+	while (1) {
+
+		/* Read one byte from semaphore; as long as semaphore has data,
+		 * there is another input blob to write to the TTY */
+		char tmp[1];
+		int c = read(input_buffer_semaphore[0],tmp,1);
+		if (c > 0) {
+			/* Retrieve blob */
+			spin_lock(&input_buffer_lock);
+			node_t * blob = list_dequeue(input_buffer_queue);
+			spin_unlock(&input_buffer_lock);
+			/* No blobs? This shouldn't happen, but just in case, just continue */
+			if (!blob) {
+				continue;
+			}
+			/* Write blob data to the tty */
+			struct input_data * value = blob->value;
+			write(fd_master, value->data, value->len);
+			free(blob->value);
+			free(blob);
+		} else {
+			/* The pipe has closed, terminal is exiting */
+			break;
+		}
+	}
+
+	return NULL;
+}
+
+static void write_input_buffer(char * data, size_t len) {
+	struct input_data * d = malloc(sizeof(struct input_data) + len);
+	d->len = len;
+	memcpy(&d->data, data, len);
+	spin_lock(&input_buffer_lock);
+	list_insert(input_buffer_queue, d);
+	spin_unlock(&input_buffer_lock);
+	write(input_buffer_semaphore[1], d, 1);
+}
+
 /* Stuffs a string into the stdin of the terminal's child process
  * Useful for things like the ANSI DSR command. */
 static void input_buffer_stuff(char * str) {
-	size_t s = strlen(str) + 1;
-	write(fd_master, str, s);
+	size_t len = strlen(str);
+	write_input_buffer(str, len);
 }
+
 
 /* Redraw the decorations */
 static void render_decors(void) {
@@ -569,13 +621,9 @@ static void draw_semi_block(int c, int x, int y, uint32_t fg, uint32_t bg) {
 	bg = premultiply(bg);
 	fg = premultiply(fg);
 	if (c == 0x2580) {
-		uint32_t t = bg;
-		bg = fg;
-		fg = t;
-		c = 0x2584;
-		for (uint8_t i = 0; i < char_height; ++i) {
+		for (uint8_t i = 0; i < char_height / 2; ++i) {
 			for (uint8_t j = 0; j < char_width; ++j) {
-				term_set_point(x+j,y+i,bg);
+				term_set_point(x+j,y+i,fg);
 			}
 		}
 	} else if (c >= 0x2589) {
@@ -597,172 +645,7 @@ static void draw_semi_block(int c, int x, int y, uint32_t fg, uint32_t bg) {
 	}
 }
 
-/* Convert unicode codepoint to fallback codepage codepoint */
-static uint32_t ununicode(uint32_t c) {
-	switch (c) {
-		case L'☺': return 1;
-		case L'☻': return 2;
-		case L'♥': return 3;
-		case L'♦': return 4;
-		case L'♣': return 5;
-		case L'♠': return 6;
-		case L'•': return 7;
-		case L'◘': return 8;
-		case L'○': return 9;
-		case L'◙': return 10;
-		case L'♂': return 11;
-		case L'♀': return 12;
-		case L'♪': return 13;
-		case L'♫': return 14;
-		case L'☼': return 15;
-		case L'►': return 16;
-		case L'◄': return 17;
-		case L'↕': return 18;
-		case L'‼': return 19;
-		case L'¶': return 20;
-		case L'§': return 21;
-		case L'▬': return 22;
-		case L'↨': return 23;
-		case L'↑': return 24;
-		case L'↓': return 25;
-		case L'→': return 26;
-		case L'←': return 27;
-		case L'∟': return 28;
-		case L'↔': return 29;
-		case L'▲': return 30;
-		case L'▼': return 31;
-		/* ASCII text */
-		case L'⌂': return 127;
-		case L'Ç': return 128;
-		case L'ü': return 129;
-		case L'é': return 130;
-		case L'â': return 131;
-		case L'ä': return 132;
-		case L'à': return 133;
-		case L'å': return 134;
-		case L'ç': return 135;
-		case L'ê': return 136;
-		case L'ë': return 137;
-		case L'è': return 138;
-		case L'ï': return 139;
-		case L'î': return 140;
-		case L'ì': return 141;
-		case L'Ä': return 142;
-		case L'Å': return 143;
-		case L'É': return 144;
-		case L'æ': return 145;
-		case L'Æ': return 146;
-		case L'ô': return 147;
-		case L'ö': return 148;
-		case L'ò': return 149;
-		case L'û': return 150;
-		case L'ù': return 151;
-		case L'ÿ': return 152;
-		case L'Ö': return 153;
-		case L'Ü': return 154;
-		case L'¢': return 155;
-		case L'£': return 156;
-		case L'¥': return 157;
-		case L'₧': return 158;
-		case L'ƒ': return 159;
-		case L'á': return 160;
-		case L'í': return 161;
-		case L'ó': return 162;
-		case L'ú': return 163;
-		case L'ñ': return 164;
-		case L'Ñ': return 165;
-		case L'ª': return 166;
-		case L'º': return 167;
-		case L'¿': return 168;
-		case L'⌐': return 169;
-		case L'¬': return 170;
-		case L'½': return 171;
-		case L'¼': return 172;
-		case L'¡': return 173;
-		case L'«': return 174;
-		case L'»': return 175;
-		case L'░': return 176;
-		case L'▒': return 177;
-		case L'▓': return 178;
-		case L'│': return 179;
-		case L'┤': return 180;
-		case L'╡': return 181;
-		case L'╢': return 182;
-		case L'╖': return 183;
-		case L'╕': return 184;
-		case L'╣': return 185;
-		case L'║': return 186;
-		case L'╗': return 187;
-		case L'╝': return 188;
-		case L'╜': return 189;
-		case L'╛': return 190;
-		case L'┐': return 191;
-		case L'└': return 192;
-		case L'┴': return 193;
-		case L'┬': return 194;
-		case L'├': return 195;
-		case L'─': return 196;
-		case L'┼': return 197;
-		case L'╞': return 198;
-		case L'╟': return 199;
-		case L'╚': return 200;
-		case L'╔': return 201;
-		case L'╩': return 202;
-		case L'╦': return 203;
-		case L'╠': return 204;
-		case L'═': return 205;
-		case L'╬': return 206;
-		case L'╧': return 207;
-		case L'╨': return 208;
-		case L'╤': return 209;
-		case L'╥': return 210;
-		case L'╙': return 211;
-		case L'╘': return 212;
-		case L'╒': return 213;
-		case L'╓': return 214;
-		case L'╫': return 215;
-		case L'╪': return 216;
-		case L'┘': return 217;
-		case L'┌': return 218;
-		case L'█': return 219;
-		case L'▄': return 220;
-		case L'▌': return 221;
-		case L'▐': return 222;
-		case L'▀': return 223;
-		case L'α': return 224;
-		case L'ß': return 225;
-		case L'Γ': return 226;
-		case L'π': return 227;
-		case L'Σ': return 228;
-		case L'σ': return 229;
-		case L'µ': return 230;
-		case L'τ': return 231;
-		case L'Φ': return 232;
-		case L'Θ': return 233;
-		case L'Ω': return 234;
-		case L'δ': return 235;
-		case L'∞': return 236;
-		case L'φ': return 237;
-		case L'ε': return 238;
-		case L'∩': return 239;
-		case L'≡': return 240;
-		case L'±': return 241;
-		case L'≥': return 242;
-		case L'≤': return 243;
-		case L'⌠': return 244;
-		case L'⌡': return 245;
-		case L'÷': return 246;
-		case L'≈': return 247;
-		case L'°': return 248;
-		case L'∙': return 249;
-		case L'·': return 250;
-		case L'√': return 251;
-		case L'ⁿ': return 252;
-		case L'²': return 253;
-		case L'■': return 254;
-	}
-	return 4;
-}
+#include "apps/ununicode.h"
 
 /* Write a character to the window. */
 static void term_write_char(uint32_t val, uint16_t x, uint16_t y, uint32_t fg, uint32_t bg, uint8_t flags) {
@@ -801,12 +684,9 @@ static void term_write_char(uint32_t val, uint16_t x, uint16_t y, uint32_t fg, u
 
 	/* Draw glyphs */
 	if (_use_aa && !_have_freetype) {
-		/* Convert other unicode characters. */
-		if (val > 128) {
-			val = ununicode(val);
-		}
 		/* Draw using the Toaru SDF rendering library */
-		char tmp[2] = {val,0};
+		char tmp[7];
+		to_eight(val, tmp);
 		for (uint8_t i = 0; i < char_height; ++i) {
 			for (uint8_t j = 0; j < char_width; ++j) {
 				term_set_point(x+j,y+i,_bg);
@@ -1175,6 +1055,10 @@ static void term_redraw_all() {
 	}
 }
 
+static void _menu_action_redraw(struct MenuEntry * self) {
+	term_redraw_all();
+}
+
 /* Remove no-longer-visible image cell data. */
 static void flush_unused_images(void) {
 	list_t * tmp = list_create();
@@ -1196,79 +1080,84 @@ static void flush_unused_images(void) {
 	images_list = tmp;
 }
 
+static void term_shift_region(int top, int height, int how_much) {
+	if (how_much == 0) return;
+
+	int destination, source;
+	int count, new_top, new_bottom;
+	if (how_much > height) {
+		count = 0;
+		new_top = top;
+		new_bottom = top + height;
+	} else if (how_much > 0) {
+		destination = term_width * top;
+		source = term_width * (top + how_much);
+		count = height - how_much;
+		new_top = top + height - how_much;
+		new_bottom = top + height;
+	} else if (how_much < 0) {
+		destination = term_width * (top - how_much);
+		source = term_width * top;
+		count = height + how_much;
+		new_top = top;
+		new_bottom = top - how_much;
+	}
+
+	/* Move from top+how_much to top */
+	if (count) {
+		memmove(term_buffer + destination, term_buffer + source, count * term_width * sizeof(term_cell_t));
+		/* Move displayed as well */
+		cell_redraw(csr_x, csr_y); /* Otherwise we may copy the inverted cursor */
+		uintptr_t dst = (uintptr_t)ctx->backbuffer + GFX_W(ctx) * (destination / term_width * char_height) * GFX_B(ctx);
+		uintptr_t src = (uintptr_t)ctx->backbuffer + GFX_W(ctx) * (source / term_width * char_height) * GFX_B(ctx);
+		if (!_no_frame) {
+			dst += (GFX_W(ctx) * (decor_top_height + menu_bar_height) + decor_left_width) * GFX_B(ctx);
+			src += (GFX_W(ctx) * (decor_top_height + menu_bar_height) + decor_left_width) * GFX_B(ctx);
+			if (dst < src) {
+				for (int i = 0; i < count * char_height; ++i) {
+					memmove((void*)(dst + i * GFX_W(ctx) * GFX_B(ctx)), (void*)(src + i * GFX_W(ctx) * GFX_B(ctx)), term_width * char_width * GFX_B(ctx));
+				}
+			} else {
+				for (int i = (count - 1) * char_height; i >= 0; --i) {
+					memmove((void*)(dst + i * GFX_W(ctx) * GFX_B(ctx)), (void*)(src + i * GFX_W(ctx) * GFX_B(ctx)), term_width * char_width * GFX_B(ctx));
+				}
+			}
+		} else {
+			size_t siz = count * char_height * GFX_W(ctx) * GFX_B(ctx);
+			memmove((void*)dst, (void*)src, siz);
+		}
+	}
+
+	/* Clear new lines at bottom */
+	for (int i = new_top; i < new_bottom; ++i) {
+		for (uint16_t x = 0; x < term_width; ++x) {
+			cell_set(x, i, ' ', current_fg, current_bg, ansi_state->flags);
+			cell_redraw(x, i);
+		}
+	}
+}
+
 /* Scroll the terminal up or down. */
 static void term_scroll(int how_much) {
 
-	/* A large scroll request should just clear the screen. */
-	if (how_much >= term_height || -how_much >= term_height) {
-		term_clear();
-		return;
-	}
-
-	/* A request to scroll 0... is a request not to scroll. */
-	if (how_much == 0) {
-		return;
-	}
-
-	/* Redraw the cursor before continuing. */
-	cell_redraw(csr_x, csr_y);
-
-	if (how_much > 0) {
-		/* Scroll up */
-		memmove(term_buffer, (void *)((uintptr_t)term_buffer + sizeof(term_cell_t) * term_width * how_much), sizeof(term_cell_t) * term_width * (term_height - how_much));
-		/* Reset the "new" row to clean cells */
-		memset((void *)((uintptr_t)term_buffer + sizeof(term_cell_t) * term_width * (term_height - how_much)), 0x0, sizeof(term_cell_t) * term_width * how_much);
-		/* In graphical modes, we will shift the graphics buffer up as necessary */
-		uintptr_t dst, src;
-		size_t    siz = char_height * (term_height - how_much) * GFX_W(ctx) * GFX_B(ctx);
-		if (!_no_frame) {
-			/* Must include decorations */
-			dst = (uintptr_t)ctx->backbuffer + (GFX_W(ctx) * (decor_top_height+menu_bar_height)) * GFX_B(ctx);
-			src = (uintptr_t)ctx->backbuffer + (GFX_W(ctx) * (decor_top_height+menu_bar_height + char_height * how_much)) * GFX_B(ctx);
-		} else {
-			/* Can skip decorations */
-			dst = (uintptr_t)ctx->backbuffer;
-			src = (uintptr_t)ctx->backbuffer + (GFX_W(ctx) *  char_height * how_much) * GFX_B(ctx);
-		}
-		/* Perform the shift */
-		memmove((void *)dst, (void *)src, siz);
-		/* And redraw the new rows */
-		for (int i = 0; i < how_much; ++i) {
-			for (uint16_t x = 0; x < term_width; ++x) {
-				cell_set(x,term_height - how_much,' ', current_fg, current_bg, ansi_state->flags);
-				cell_redraw(x, term_height - how_much);
-			}
-		}
-	} else {
-		how_much = -how_much;
-		/* Scroll down */
-		memmove((void *)((uintptr_t)term_buffer + sizeof(term_cell_t) * term_width * how_much), term_buffer, sizeof(term_cell_t) * term_width * (term_height - how_much));
-		/* Reset the "new" row to clean cells */
-		memset(term_buffer, 0x0, sizeof(term_cell_t) * term_width * how_much);
-		uintptr_t dst, src;
-		size_t    siz = char_height * (term_height - how_much) * GFX_W(ctx) * GFX_B(ctx);
-		if (!_no_frame) {
-			src = (uintptr_t)ctx->backbuffer + (GFX_W(ctx) * (decor_top_height+menu_bar_height)) * GFX_B(ctx);
-			dst = (uintptr_t)ctx->backbuffer + (GFX_W(ctx) * (decor_top_height+menu_bar_height + char_height * how_much)) * GFX_B(ctx);
-		} else {
-			src = (uintptr_t)ctx->backbuffer;
-			dst = (uintptr_t)ctx->backbuffer + (GFX_W(ctx) *  char_height * how_much) * GFX_B(ctx);
-		}
-		/* Perform the shift */
-		memmove((void *)dst, (void *)src, siz);
-		/* And redraw the new rows */
-		for (int i = 0; i < how_much; ++i) {
-			for (uint16_t x = 0; x < term_width; ++x) {
-				cell_redraw(x, i);
-			}
-		}
-	}
+	term_shift_region(0, term_height, how_much);
 
 	/* Remove image data for image cells that are no longer on screen. */
 	flush_unused_images();
 
 	/* Flip the entire window. */
 	yutani_flip(yctx, window);
+}
+
+static void insert_delete_lines(int how_many) {
+	if (how_many == 0) return;
+
+	if (how_many > 0) {
+		/* Insert lines is equivalent to scrolling from the current line */
+		term_shift_region(csr_y,term_height-csr_y,-how_many);
+	} else {
+		term_shift_region(csr_y,term_height-csr_y,-how_many);
+	}
 }
 
 /* Is this a wide character? (does wcwidth == 2) */
@@ -1282,7 +1171,9 @@ static void save_scrollback(void) {
 
 	/* If the scrollback is already full, remove the oldest element. */
 	if (scrollback_list->length == MAX_SCROLLBACK) {
-		free(list_dequeue(scrollback_list));
+		node_t * n = list_dequeue(scrollback_list);
+		free(n->value);
+		free(n);
 	}
 
 	struct scrollback_row * row = malloc(sizeof(struct scrollback_row) + sizeof(term_cell_t) * term_width + 20);
@@ -1586,11 +1477,11 @@ term_callbacks_t term_callbacks = {
 	term_get_cell_height,
 	term_set_csr_show,
 	term_switch_buffer,
+	insert_delete_lines,
 };
 
-/* Write data into the PTY */
 static void handle_input(char c) {
-	write(fd_master, &c, 1);
+	write_input_buffer(&c, 1);
 	display_flip();
 	if (scrollback_offset != 0) {
 		scrollback_offset = 0;
@@ -1598,15 +1489,16 @@ static void handle_input(char c) {
 	}
 }
 
-/* Write a string into the PTY */
 static void handle_input_s(char * c) {
-	write(fd_master, c, strlen(c));
+	size_t len = strlen(c);
+	write_input_buffer(c, len);
 	display_flip();
 	if (scrollback_offset != 0) {
 		scrollback_offset = 0;
 		term_redraw_all();
 	}
 }
+
 
 /* Scroll the view up (scrollback) */
 static void scroll_up(int amount) {
@@ -1845,6 +1737,7 @@ static void check_for_exit(void) {
 	/* Write [Process terminated] */
 	char exit_message[] = "[Process terminated]\n";
 	write(fd_slave, exit_message, sizeof(exit_message));
+	close(input_buffer_semaphore[1]);
 }
 
 static term_cell_t * copy_terminal(int old_width, int old_height, term_cell_t * term_buffer) {
@@ -2022,9 +1915,15 @@ static void resize_finish(int width, int height) {
 
 /* Insert a mouse event sequence into the PTY */
 static void mouse_event(int button, int x, int y) {
-	char buf[7];
-	sprintf(buf, "\033[M%c%c%c", button + 32, x + 33, y + 33);
-	handle_input_s(buf);
+	if (ansi_state->mouse_on & TERMEMU_MOUSE_SGR) {
+		char buf[100];
+		sprintf(buf,"\033[<%d;%d;%d%c", button == 3 ? 0 : button, x+1, y+1, button == 3 ? 'm' : 'M');
+		handle_input_s(buf);
+	} else {
+		char buf[7];
+		sprintf(buf, "\033[M%c%c%c", button + 32, x + 33, y + 33);
+		handle_input_s(buf);
+	}
 }
 
 /* Handle Yutani messages */
@@ -2092,7 +1991,13 @@ static void * handle_incoming(void) {
 						memcpy(selection_text, cb->content, cb->size);
 						selection_text[cb->size] = '\0';
 					}
-					handle_input_s(selection_text);
+					if (ansi_state->paste_mode) {
+						handle_input_s("\033[200~");
+						handle_input_s(selection_text);
+						handle_input_s("\033[201~");
+					} else {
+						handle_input_s(selection_text);
+					}
 				}
 				break;
 			case YUTANI_MSG_WINDOW_MOUSE_EVENT:
@@ -2144,7 +2049,7 @@ static void * handle_incoming(void) {
 					if (new_x >= term_width || new_y >= term_height) break;
 
 					/* Map Cursor Action */
-					if (ansi_state->mouse_on && !(me->modifiers & YUTANI_KEY_MODIFIER_SHIFT)) {
+					if ((ansi_state->mouse_on & TERMEMU_MOUSE_ENABLE) && !(me->modifiers & YUTANI_KEY_MODIFIER_SHIFT)) {
 
 						if (me->buttons & YUTANI_MOUSE_SCROLL_UP) {
 							mouse_event(32+32, new_x, new_y);
@@ -2175,7 +2080,7 @@ static void * handle_incoming(void) {
 							last_mouse_x = new_x;
 							last_mouse_y = new_y;
 							button_state = me->buttons;
-						} else if (ansi_state->mouse_on == 2) {
+						} else if (ansi_state->mouse_on & TERMEMU_MOUSE_DRAG) {
 							/* Report motion for pressed buttons */
 							if (last_mouse_x == new_x && last_mouse_y == new_y) break;
 							if (button_state & YUTANI_MOUSE_BUTTON_LEFT) mouse_event(32, new_x, new_y);
@@ -2274,7 +2179,7 @@ static void _menu_action_toggle_free_size(struct MenuEntry * self) {
 
 static void _menu_action_show_about(struct MenuEntry * self) {
 	char about_cmd[1024] = "\0";
-	strcat(about_cmd, "about \"About Terminal\" /usr/share/icons/48/utilities-terminal.bmp \"ToaruOS Terminal\" \"(C) 2013-2018 K. Lange\n-\nPart of ToaruOS, which is free software\nreleased under the NCSA/University of Illinois\nlicense.\n-\n%https://toaruos.org\n%https://github.com/klange/toaruos\" ");
+	strcat(about_cmd, "about \"About Terminal\" /usr/share/icons/48/utilities-terminal.png \"ToaruOS Terminal\" \"(C) 2013-2020 K. Lange\n-\nPart of ToaruOS, which is free software\nreleased under the NCSA/University of Illinois\nlicense.\n-\n%https://toaruos.org\n%https://github.com/klange/toaruos\" ");
 	char coords[100];
 	sprintf(coords, "%d %d &", (int)window->x + (int)window->width / 2, (int)window->y + (int)window->height / 2);
 	strcat(about_cmd, coords);
@@ -2428,9 +2333,11 @@ int main(int argc, char ** argv) {
 	menu_right_click = menu_create();
 	menu_insert(menu_right_click, _menu_copy);
 	menu_insert(menu_right_click, _menu_paste);
-	menu_insert(menu_right_click, menu_create_separator());
-	_menu_toggle_borders_context = menu_create_normal(NULL, NULL, _no_frame ? "Show borders" : "Hide borders", _menu_action_hide_borders);
-	menu_insert(menu_right_click, _menu_toggle_borders_context);
+	if (!_fullscreen) {
+		menu_insert(menu_right_click, menu_create_separator());
+		_menu_toggle_borders_context = menu_create_normal(NULL, NULL, _no_frame ? "Show borders" : "Hide borders", _menu_action_hide_borders);
+		menu_insert(menu_right_click, _menu_toggle_borders_context);
+	}
 	menu_insert(menu_right_click, menu_create_separator());
 	menu_insert(menu_right_click, _menu_exit);
 
@@ -2459,6 +2366,8 @@ int main(int argc, char ** argv) {
 	menu_insert(m, menu_create_submenu(NULL,"zoom","Set zoom..."));
 	menu_insert(m, menu_create_normal(NULL, NULL, _use_aa ? "Bitmap font" : "Anti-aliased font", _menu_action_toggle_sdf));
 	menu_insert(m, menu_create_normal(NULL, NULL, _free_size ? "Snap to Cell Size" : "Freely Resize", _menu_action_toggle_free_size));
+	menu_insert(m, menu_create_separator());
+	menu_insert(m, menu_create_normal(NULL, NULL, "Redraw", _menu_action_redraw));
 	menu_set_insert(terminal_menu_bar.set, "view", m);
 
 	m = menu_create();
@@ -2485,6 +2394,12 @@ int main(int argc, char ** argv) {
 
 	/* Initialize the terminal buffer and ANSI library for the first time. */
 	reinit();
+
+	/* Run thread to handle asynchronous writes to the tty */
+	pthread_t input_buffer_thread;
+	pipe(input_buffer_semaphore);
+	input_buffer_queue = list_create();
+	pthread_create(&input_buffer_thread, NULL, handle_input_writing, NULL);
 
 	/* Make sure we're not passing anything to stdin on the child */
 	fflush(stdin);
@@ -2527,34 +2442,34 @@ int main(int argc, char ** argv) {
 		int fds[2] = {fileno(yctx->sock), fd_master};
 
 		/* PTY read buffer */
-		unsigned char buf[1024];
+		unsigned char buf[4096];
 
 		while (!exit_application) {
 
 			/* Wait for something to happen. */
-			int index = fswait2(2,fds,200);
+			int res[] = {0,0};
+			fswait3(2,fds,200,res);
 
 			/* Check if the child application has closed. */
 			check_for_exit();
+			maybe_flip_cursor();
 
-			if (index == 1) {
+			if (res[1]) {
 				/* Read from PTY */
-				maybe_flip_cursor();
-				int r = read(fd_master, buf, 1024);
+				int r = read(fd_master, buf, 4096);
 				for (int i = 0; i < r; ++i) {
 					ansi_put(ansi_state, buf[i]);
 				}
 				display_flip();
-			} else if (index == 0) {
+			}
+			if (res[0]) {
 				/* Handle Yutani events. */
-				maybe_flip_cursor();
 				handle_incoming();
-			} else if (index == 2) {
-				/* Timeout, flip the cursor. */
-				maybe_flip_cursor();
 			}
 		}
 	}
+
+	close(input_buffer_semaphore[1]);
 
 	/* Windows will close automatically on exit. */
 	return 0;

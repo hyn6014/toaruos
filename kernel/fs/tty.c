@@ -650,8 +650,6 @@ pty_t * pty_new(struct winsize * size) {
 	pty->in  = ring_buffer_create(TTY_BUFFER_SIZE);
 	pty->out = ring_buffer_create(TTY_BUFFER_SIZE);
 
-	pty->in->discard = 1;
-
 	/* Master endpoint - writes go to stdin, reads come from stdout */
 	pty->master = pty_master_create(pty);
 

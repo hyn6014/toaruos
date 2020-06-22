@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 
 #include <sys/ioctl.h>
 
@@ -395,7 +396,40 @@ void blur_context_box(gfx_context_t * _src, int radius) {
 	_box_blur_vertical(_src,radius);
 }
 
+static int (*load_sprite_jpg)(sprite_t *, char *) = NULL;
+static int (*load_sprite_png)(sprite_t *, char *) = NULL;
+
+/**
+ * TODO: This should probably use some config file or plugin path
+ *       for better discovery; we could rename these libraries and
+ *       not have applications / other libraries depend on them
+ *       directly and instead go through libtoaru_graphics.
+ */
+__attribute__((constructor)) static void _load_format_libraries() {
+	void * _lib_jpeg = dlopen("libtoaru_jpeg.so", 0);
+	if (_lib_jpeg) load_sprite_jpg = dlsym(_lib_jpeg, "load_sprite_jpg");
+	void * _lib_png = dlopen("libtoaru_png.so", 0);
+	if (_lib_png) load_sprite_png = dlsym(_lib_png, "load_sprite_png");
+}
+
+static char * extension_from_filename(char * filename) {
+	char * ext = strrchr(filename, '.');
+	if (ext && *ext == '.') return ext + 1;
+	return "";
+}
+
 int load_sprite(sprite_t * sprite, char * filename) {
+
+	char * ext = extension_from_filename(filename);
+
+	if (!strcmp(ext,"png") || !strcmp(ext,"sdf")) return load_sprite_png(sprite, filename);
+	if (!strcmp(ext,"jpg") || !strcmp(ext,"jpeg")) return load_sprite_jpg(sprite, filename);
+
+	/* Fall back to bitmap */
+	return load_sprite_bmp(sprite, filename);
+}
+
+int load_sprite_bmp(sprite_t * sprite, char * filename) {
 	/* Open the requested binary */
 	FILE * image = fopen(filename, "r");
 
@@ -429,6 +463,17 @@ int load_sprite(sprite_t * sprite, char * filename) {
 		sprite->bitmap = malloc(sizeof(uint32_t) * width * height);
 		sprite->masks = NULL;
 
+		int alpha_after = ((unsigned char *)&bufferi[13])[2] == 0xFF;
+
+		#define _BMP_A 0x1000000
+		#define _BMP_R 0x1
+		#define _BMP_G 0x100
+		#define _BMP_B 0x10000
+
+		if (bpp == 32) {
+			sprite->alpha = ALPHA_EMBEDDED;
+		}
+
 		for (y = 0; y < height; ++y) {
 			for (x = 0; x < width; ++x) {
 				if (i > image_size) goto _cleanup_sprite;
@@ -438,16 +483,18 @@ int load_sprite(sprite_t * sprite, char * filename) {
 					color =	(bufferb[i   + 3 * x] & 0xFF) +
 							(bufferb[i+1 + 3 * x] & 0xFF) * 0x100 +
 							(bufferb[i+2 + 3 * x] & 0xFF) * 0x10000 + 0xFF000000;
-				} else if (bpp == 32) {
-					if (bufferb[i + 4 * x] == 0) {
-						color = 0x000000;
-					} else {
-						color =	(bufferb[i   + 4 * x] & 0xFF) * 0x1000000 +
-								(bufferb[i+1 + 4 * x] & 0xFF) * 0x1 +
-								(bufferb[i+2 + 4 * x] & 0xFF) * 0x100 +
-								(bufferb[i+3 + 4 * x] & 0xFF) * 0x10000;
-						color = premultiply(color);
-					}
+				} else if (bpp == 32 && alpha_after == 0) {
+					color =	(bufferb[i   + 4 * x] & 0xFF) * _BMP_A +
+							(bufferb[i+1 + 4 * x] & 0xFF) * _BMP_R +
+							(bufferb[i+2 + 4 * x] & 0xFF) * _BMP_G +
+							(bufferb[i+3 + 4 * x] & 0xFF) * _BMP_B;
+					color = premultiply(color);
+				} else if (bpp == 32 && alpha_after == 1) {
+					color =	(bufferb[i   + 4 * x] & 0xFF) * _BMP_R +
+							(bufferb[i+1 + 4 * x] & 0xFF) * _BMP_G +
+							(bufferb[i+2 + 4 * x] & 0xFF) * _BMP_B +
+							(bufferb[i+3 + 4 * x] & 0xFF) * _BMP_A;
+					color = premultiply(color);
 				} else {
 					color = rgb(bufferb[i + x],bufferb[i + x],bufferb[i + x]); /* Unsupported */
 				}

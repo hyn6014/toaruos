@@ -1,11 +1,12 @@
 /**
  * This is a baked, single-file version of bim.
- * It was built Wed Aug 28 22:49:42 2019
- * It is based on git commit 4f52c877d6c208a30feac7afefb3e141a8adf5fd
+ * It was built Thu Feb 27 21:56:23 2020
+ * It is based on git commit 83e6cc609584bd31e961c3873a9f3a5c7c2973ec
  */
+#define GIT_TAG "83e6cc6-baked"
 /* Bim - A Text Editor
  *
- * Copyright (C) 2012-2019 K. Lange
+ * Copyright (C) 2012-2020 K. Lange
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -54,8 +55,8 @@
 # define TAG ""
 #endif
 
-#define BIM_VERSION   "2.0.0" TAG
-#define BIM_COPYRIGHT "Copyright 2012-2019 K. Lange <\033[3mklange@toaruos.org\033[23m>"
+#define BIM_VERSION   "2.6.1" TAG
+#define BIM_COPYRIGHT "Copyright 2012-2020 K. Lange <\033[3mklange@toaruos.org\033[23m>"
 
 #define BLOCK_SIZE 4096
 #define ENTER_KEY     '\r'
@@ -82,8 +83,12 @@ enum Key {
 	KEY_DELETE = 0x7F,
 	/* Unicode codepoints go here */
 	KEY_ESCAPE = 0x400000, /* Escape would normally be 27, but is special because reasons */
-	KEY_F1, KEY_F2, KEY_F3, KEY_F4, /* TODO other F keys */
+	KEY_F1, KEY_F2, KEY_F3, KEY_F4,
+	KEY_F5, KEY_F6, KEY_F7, KEY_F8,
+	KEY_F9, KEY_F10, KEY_F11, KEY_F12,
+	/* TODO ALT, SHIFT, etc., for F keys */
 	KEY_MOUSE, /* Must be followed with a 3-byte mouse read */
+	KEY_MOUSE_SGR, /* Followed by an SGR-style sequence of mouse data */
 	KEY_HOME, KEY_END, KEY_PAGE_UP, KEY_PAGE_DOWN,
 	KEY_UP, KEY_DOWN, KEY_RIGHT, KEY_LEFT,
 	KEY_SHIFT_UP, KEY_SHIFT_DOWN, KEY_SHIFT_RIGHT, KEY_SHIFT_LEFT,
@@ -91,6 +96,8 @@ enum Key {
 	KEY_ALT_UP, KEY_ALT_DOWN, KEY_ALT_RIGHT, KEY_ALT_LEFT,
 	KEY_ALT_SHIFT_UP, KEY_ALT_SHIFT_DOWN, KEY_ALT_SHIFT_RIGHT, KEY_ALT_SHIFT_LEFT,
 	KEY_SHIFT_TAB,
+	/* Special signals for paste start, paste end */
+	KEY_PASTE_BEGIN, KEY_PASTE_END,
 };
 
 struct key_name_map {
@@ -192,6 +199,8 @@ typedef struct {
 	unsigned int can_24bit:1;
 	unsigned int can_256color:1;
 	unsigned int can_italic:1;
+	unsigned int can_insert:1;
+	unsigned int can_bracketedpaste:1;
 	unsigned int history_enabled:1;
 	unsigned int highlight_parens:1;
 	unsigned int smart_case:1;
@@ -202,10 +211,21 @@ typedef struct {
 	unsigned int relative_lines:1;
 	unsigned int numbers:1;
 	unsigned int horizontal_shift_scrolling:1;
+	unsigned int hide_statusbar:1;
+	unsigned int tabs_visible:1;
+	unsigned int autohide_tabs:1;
+	unsigned int smart_complete:1;
+	unsigned int has_terminal:1;
+	unsigned int use_sgr_mouse:1;
+	unsigned int search_wraps:1;
 
 	int cursor_padding;
 	int split_percent;
 	int scroll_amount;
+	int tab_offset;
+
+	char * tab_indicator;
+	char * space_indicator;
 
 } global_config_t;
 
@@ -270,8 +290,11 @@ typedef struct _env {
 	unsigned int indent:1;
 	unsigned int checkgitstatusonwrite:1;
 	unsigned int crnl:1;
+	unsigned int numbers:1;
+	unsigned int gutter:1;
 
 	int highlighting_paren;
+	int maxcolumn;
 
 	short  mode;
 	short  tabstop;
@@ -301,7 +324,7 @@ typedef struct _env {
 
 struct theme_def {
 	const char * name;
-	void (*load)(void);
+	void (*load)(const char * name);
 };
 
 extern struct theme_def * themes;
@@ -315,11 +338,19 @@ struct syntax_state {
 	int i;
 };
 
+struct completion_match {
+	char * string;
+	char * file;
+	char * search;
+};
+
 struct syntax_definition {
 	char * name;
 	char ** ext;
 	int (*calculate)(struct syntax_state *);
 	int prefers_spaces;
+	int (*completion_qualifier)(int c);
+	int (*completion_matcher)(uint32_t * comp, struct completion_match ** matches, int * matches_count, int complete_match, int * matches_len);
 };
 
 extern struct syntax_definition * syntaxes;
@@ -346,6 +377,7 @@ extern const char * COLOR_NUMBER_FG;
 extern const char * COLOR_NUMBER_BG;
 extern const char * COLOR_STATUS_FG;
 extern const char * COLOR_STATUS_BG;
+extern const char * COLOR_STATUS_ALT;
 extern const char * COLOR_TABBAR_BG;
 extern const char * COLOR_TAB_BG;
 extern const char * COLOR_ERROR_FG;
@@ -373,6 +405,8 @@ struct action_def {
 	int options;
 	const char * description;
 };
+
+extern struct action_def * mappable_actions;
 
 #define ARG_IS_INPUT   0x01 /* Takes the key that triggered it as the first argument */
 #define ARG_IS_CUSTOM  0x02 /* Takes a custom argument which is specific to the method */
@@ -448,26 +482,91 @@ extern void recalculate_selected_lines(void);
 extern void add_command(struct command_def command);
 extern void add_prefix_command(struct command_def command);
 extern void render_command_input_buffer(void);
+extern void unhighlight_matching_paren(void);
 
 extern void add_syntax(struct syntax_definition def);
 
-/* End of bim-core.h */
+struct ColorName {
+	const char * name;
+	const char ** value;
+};
 
-/* Included from bim-theme.h */
-#define BIM_THEME(name) \
-	static void load_colorscheme_ ## name (void); \
-	__attribute__((constructor)) static void _load_ ## name (void) { \
-		add_colorscheme((struct theme_def){#name, load_colorscheme_ ## name}); \
+extern struct ColorName color_names[];
+
+struct bim_function {
+	char * command;
+	struct bim_function * next;
+};
+
+extern struct bim_function ** user_functions;
+extern int run_function(char * name);
+extern int has_function(char * name);
+extern void find_matching_paren(int * out_line, int * out_col, int in_col);
+extern void render_error(char * message, ...);
+extern void pause_for_key(void);
+
+#define add_match(match_string, match_file, match_search) do { \
+	if (*matches_count == *matches_len) { \
+		(*matches_len) *= 2; \
+		*matches = realloc(*matches, sizeof(struct completion_match) * (*matches_len)); \
 	} \
-	static void load_colorscheme_ ## name (void)
+	(*matches)[*matches_count].string = strdup(match_string); \
+	(*matches)[*matches_count].file = strdup(match_file); \
+	(*matches)[*matches_count].search = strdup(match_search); \
+	(*matches_count)++; \
+} while (0)
 
-/* End of bim-theme.h */
+#define add_if_match(name,desc) do { \
+	int i = 0; \
+	while (comp[i] && comp[i] == (unsigned char)name[i]) i++; \
+	if (comp[i] == '\0') { \
+		add_match(name,desc,""); \
+	} \
+} while (0)
+
+struct action_map {
+	int key;
+	void (*method)();
+	int options;
+	int arg;
+};
+
+#define opt_rep  0x1 /* This action will be repeated */
+#define opt_arg  0x2 /* This action will take a specified argument */
+#define opt_char 0x4 /* This action will read a character to pass as an argument */
+#define opt_nav  0x8 /* This action will consume the nav buffer as its argument */
+#define opt_rw   0x10 /* Must not be read-only */
+#define opt_norm 0x20 /* Returns to normal mode */
+#define opt_byte 0x40 /* Same as opt_char but forces a byte */
+
+struct mode_names {
+	const char * description;
+	const char * name;
+	struct action_map ** mode;
+};
+
+extern struct mode_names mode_names[];
+
+/* End of bim-core.h */
 
 /* Included from bim-syntax.h */
 #define BIM_SYNTAX(name, spaces) \
 	__attribute__((constructor)) static void _load_ ## name (void) { \
-		add_syntax((struct syntax_definition){#name, syn_ ## name ## _ext, syn_ ## name ## _calculate, spaces}); \
+		add_syntax((struct syntax_definition){#name, syn_ ## name ## _ext, syn_ ## name ## _calculate, spaces, NULL, NULL}); \
 	} \
+
+#define BIM_SYNTAX_EXT(name, spaces, matcher) \
+	__attribute__((constructor)) static void _load_ ## name (void) { \
+		add_syntax((struct syntax_definition){#name, syn_ ## name ## _ext, syn_ ## name ## _calculate, spaces, matcher, _match_completions_ ## name}); \
+	} \
+
+#define BIM_SYNTAX_COMPLETER(name) \
+	static int _match_completions_ ## name ( \
+		uint32_t * comp __attribute__((unused)), \
+		struct completion_match **matches __attribute__((unused)), \
+		int * matches_count __attribute__((unused)), \
+		int complete_match __attribute__((unused)), \
+		int *matches_len __attribute__((unused)))
 
 #define paint(length, flag) do { for (int i = 0; i < (length) && state->i < state->line->actual; i++, state->i++) { state->line->text[state->i].flags = (flag); } } while (0)
 #define charat() (state->i < state->line->actual ? state->line->text[(state->i)].codepoint : -1)
@@ -545,6 +644,8 @@ global_config_t global_config = {
 	.can_24bit = 1, /* can use 24-bit color */
 	.can_256color = 1, /* can use 265 colors */
 	.can_italic = 1, /* can use italics (without inverting) */
+	.can_insert = 0, /* ^[[L */
+	.can_bracketedpaste = 0, /* puts escapes before and after pasted stuff */
 	/* Configuration options */
 	.history_enabled = 1,
 	.highlight_parens = 1, /* highlight parens/braces when cursor moves */
@@ -556,10 +657,18 @@ global_config_t global_config = {
 	.relative_lines = 0,
 	.numbers = 1,
 	.horizontal_shift_scrolling = 0, /* Whether to shift the whole screen when scrolling horizontally */
+	.hide_statusbar = 0,
+	.tabs_visible = 1,
+	.autohide_tabs = 0,
+	.smart_complete = 0,
+	.has_terminal = 0,
+	.use_sgr_mouse = 0,
+	.search_wraps = 1,
 	/* Integer config values */
 	.cursor_padding = 4,
 	.split_percent = 50,
 	.scroll_amount = 5,
+	.tab_offset = 0,
 };
 
 struct key_name_map KeyNames[] = {
@@ -574,7 +683,10 @@ struct key_name_map KeyNames[] = {
 	{'|', "<pipe>"},
 	{KEY_DELETE, "<del>"},
 	{KEY_MOUSE, "<mouse>"},
+	{KEY_MOUSE_SGR, "<mouse-sgr>"},
 	{KEY_F1, "<f1>"},{KEY_F2, "<f2>"},{KEY_F3, "<f3>"},{KEY_F4, "<f4>"},
+	{KEY_F5, "<f5>"},{KEY_F6, "<f6>"},{KEY_F7, "<f7>"},{KEY_F8, "<f8>"},
+	{KEY_F9, "<f9>"},{KEY_F10, "<f10>"},{KEY_F11, "<f11>"},{KEY_F12, "<f12>"},
 	{KEY_HOME,"<home>"},{KEY_END,"<end>"},{KEY_PAGE_UP,"<page-up>"},{KEY_PAGE_DOWN,"<page-down>"},
 	{KEY_UP, "<up>"},{KEY_DOWN, "<down>"},{KEY_RIGHT, "<right>"},{KEY_LEFT, "<left>"},
 	{KEY_SHIFT_UP, "<shift-up>"},{KEY_SHIFT_DOWN, "<shift-down>"},{KEY_SHIFT_RIGHT, "<shift-right>"},{KEY_SHIFT_LEFT, "<shift-left>"},
@@ -582,6 +694,7 @@ struct key_name_map KeyNames[] = {
 	{KEY_ALT_UP, "<alt-up>"},{KEY_ALT_DOWN, "<alt-down>"},{KEY_ALT_RIGHT, "<alt-right>"},{KEY_ALT_LEFT, "<alt-left>"},
 	{KEY_ALT_SHIFT_UP, "<alt-shift-up>"},{KEY_ALT_SHIFT_DOWN, "<alt-shift-down>"},{KEY_ALT_SHIFT_RIGHT, "<alt-shift-right>"},{KEY_ALT_SHIFT_LEFT, "<alt-shift-left>"},
 	{KEY_SHIFT_TAB,"<shift-tab>"},
+	{KEY_PASTE_BEGIN,"<paste-begin>"},{KEY_PASTE_END,"<paste-end>"},
 };
 
 char * name_from_key(enum Key keycode) {
@@ -598,6 +711,39 @@ char * name_from_key(enum Key keycode) {
 	to_eight(keycode, keyNameTmp);
 	return keyNameTmp;
 }
+
+struct ColorName color_names[] = {
+	{"text-fg", &COLOR_FG},
+	{"text-bg", &COLOR_BG},
+	{"alternate-fg", &COLOR_ALT_FG},
+	{"alternate-bg", &COLOR_ALT_BG},
+	{"number-fg", &COLOR_NUMBER_FG},
+	{"number-bg", &COLOR_NUMBER_BG},
+	{"status-fg", &COLOR_STATUS_FG},
+	{"status-bg", &COLOR_STATUS_BG},
+	{"status-alt", &COLOR_STATUS_ALT},
+	{"tabbar-bg", &COLOR_TABBAR_BG},
+	{"tab-bg", &COLOR_TAB_BG},
+	{"error-fg", &COLOR_ERROR_FG},
+	{"error-bg", &COLOR_ERROR_BG},
+	{"search-fg", &COLOR_SEARCH_FG},
+	{"search-bg", &COLOR_SEARCH_BG},
+	{"keyword", &COLOR_KEYWORD},
+	{"string", &COLOR_STRING},
+	{"comment", &COLOR_COMMENT},
+	{"type", &COLOR_TYPE},
+	{"pragma", &COLOR_PRAGMA},
+	{"numeral", &COLOR_NUMERAL},
+	{"select-fg", &COLOR_SELECTFG},
+	{"select-bg", &COLOR_SELECTBG},
+	{"red", &COLOR_RED},
+	{"green", &COLOR_GREEN},
+	{"bold", &COLOR_BOLD},
+	{"link", &COLOR_LINK},
+	{"escape", &COLOR_ESCAPE},
+	{NULL,NULL},
+};
+
 
 #define FLEXIBLE_ARRAY(name, add_name, type, zero) \
 	int flex_ ## name ## _count = 0; \
@@ -620,6 +766,7 @@ FLEXIBLE_ARRAY(mappable_actions, add_action, struct action_def, ((struct action_
 FLEXIBLE_ARRAY(regular_commands, add_command, struct command_def, ((struct command_def){NULL,NULL,NULL}))
 FLEXIBLE_ARRAY(prefix_commands, add_prefix_command, struct command_def, ((struct command_def){NULL,NULL,NULL}))
 FLEXIBLE_ARRAY(themes, add_colorscheme, struct theme_def, ((struct theme_def){NULL,NULL}))
+FLEXIBLE_ARRAY(user_functions, add_user_function, struct bim_function *, NULL)
 
 /**
  * Special implementation of getch with a timeout
@@ -781,6 +928,7 @@ int bim_getkey(int read_timeout) {
 				if (timeout >= 2 && this_buf[0] == '\033' && this_buf[1] == '[') {
 					switch (c) {
 						case 'M': timeout = 0; return KEY_MOUSE;
+						case '<': timeout = 0; return KEY_MOUSE_SGR;
 						case 'A': return shift_key(KEY_UP);
 						case 'B': return shift_key(KEY_DOWN);
 						case 'C': return shift_key(KEY_RIGHT);
@@ -791,12 +939,34 @@ int bim_getkey(int read_timeout) {
 						case 'G': timeout = 0; return KEY_PAGE_DOWN;
 						case 'Z': timeout = 0; return KEY_SHIFT_TAB;
 						case '~':
-							switch (this_buf[timeout-1]) {
-								case '1': timeout = 0; return KEY_HOME;
-								case '3': timeout = 0; return KEY_DELETE;
-								case '4': timeout = 0; return KEY_END;
-								case '5': timeout = 0; return KEY_PAGE_UP;
-								case '6': timeout = 0; return KEY_PAGE_DOWN;
+							if (timeout == 3) {
+								switch (this_buf[2]) {
+									case '1': timeout = 0; return KEY_HOME;
+									case '3': timeout = 0; return KEY_DELETE;
+									case '4': timeout = 0; return KEY_END;
+									case '5': timeout = 0; return KEY_PAGE_UP;
+									case '6': timeout = 0; return KEY_PAGE_DOWN;
+								}
+							} else if (timeout == 5) {
+								if (this_buf[2] == '2' && this_buf[3] == '0' && this_buf[4] == '0') {
+									return KEY_PASTE_BEGIN;
+								} else if (this_buf[2] == '2' && this_buf[3] == '0' && this_buf[4] == '1') {
+									return KEY_PASTE_END;
+								}
+							} else if (this_buf[2] == '1') {
+								switch (this_buf[3]) {
+									case '5': return KEY_F5;
+									case '7': return KEY_F6;
+									case '8': return KEY_F7;
+									case '9': return KEY_F8;
+								}
+							} else if (this_buf[2] == '2') {
+								switch (this_buf[3]) {
+									case '0': return KEY_F9;
+									case '1': return KEY_F10;
+									case '3': return KEY_F11;
+									case '4': return KEY_F12;
+								}
 							}
 							break;
 					}
@@ -811,6 +981,29 @@ int bim_getkey(int read_timeout) {
 
 	return KEY_TIMEOUT;
 }
+
+enum Key key_from_name(char * name) {
+	for (unsigned int i = 0;  i < sizeof(KeyNames)/sizeof(KeyNames[0]); ++i) {
+		if (!strcmp(KeyNames[i].name, name)) return KeyNames[i].keycode;
+	}
+	if (name[0] == '^' && name[1] && !name[2]) {
+		return name[1] - '@';
+	}
+	if (!name[1]) return name[0];
+	/* Try decoding */
+	uint32_t c, state = 0;
+	int candidate = -1;
+	while (*name) {
+		if (!decode(&state, &c, (unsigned char)*name)) {
+			if (candidate == -1) candidate = c;
+			else return -1; /* Multiple characters */
+		} else if (state == UTF8_REJECT) {
+			return -1;
+		}
+	}
+	return candidate;
+}
+
 
 /**
  * Pointer to current active buffer
@@ -859,7 +1052,10 @@ buffer_t * buffer_new(void) {
 	buffers[buffers_len]->left = 0;
 	buffers[buffers_len]->width = global_config.term_width;
 	buffers[buffers_len]->highlighting_paren = -1;
+	buffers[buffers_len]->numbers = global_config.numbers;
+	buffers[buffers_len]->gutter = 1;
 	buffers_len++;
+	global_config.tabs_visible = (!global_config.autohide_tabs) || (buffers_len > 1);
 
 	return buffers[buffers_len-1];
 }
@@ -1031,6 +1227,8 @@ buffer_t * buffer_close(buffer_t * buf) {
 
 	/* There is one less buffer */
 	buffers_len--;
+	if (buffers_len && global_config.tab_offset >= buffers_len) global_config.tab_offset--;
+	global_config.tabs_visible = (!global_config.autohide_tabs) || (buffers_len > 1);
 	if (!buffers_len) { 
 		/* There are no more buffers. */
 		return NULL;
@@ -1061,6 +1259,7 @@ const char * COLOR_NUMBER_FG = "@9";
 const char * COLOR_NUMBER_BG = "@9";
 const char * COLOR_STATUS_FG = "@9";
 const char * COLOR_STATUS_BG = "@9";
+const char * COLOR_STATUS_ALT= "@9";
 const char * COLOR_TABBAR_BG = "@9";
 const char * COLOR_TAB_BG    = "@9";
 const char * COLOR_ERROR_FG  = "@9";
@@ -1390,7 +1589,7 @@ void set_history_break(void) {
 /**
  * Insert a character into an existing line.
  */
-line_t * line_insert(line_t * line, char_t c, int offset, int lineno) {
+__attribute__((warn_unused_result)) line_t * line_insert(line_t * line, char_t c, int offset, int lineno) {
 
 	if (!env->loading && global_config.history_enabled && lineno != -1) {
 		history_t * e = malloc(sizeof(history_t));
@@ -1675,6 +1874,10 @@ line_t ** split_line(line_t ** lines, int line, int split) {
 		lines = realloc(lines, sizeof(line_t *) * env->line_avail);
 	}
 
+	if (!env->loading) {
+		unhighlight_matching_paren();
+	}
+
 	/* Shift later lines down */
 	if (line < env->line_count) {
 		memmove(&lines[line+2], &lines[line+1], sizeof(line_t *) * (env->line_count - line));
@@ -1731,7 +1934,7 @@ int line_ends_with_brace(line_t * line) {
 		}
 	}
 	if (i < 0) return 0;
-	return (line->text[i].codepoint == '{' || line->text[i].codepoint == ':');
+	return (line->text[i].codepoint == '{' || line->text[i].codepoint == ':') ? i+1 : 0;
 }
 
 int line_is_comment(line_t * line) {
@@ -1741,11 +1944,40 @@ int line_is_comment(line_t * line) {
 		if (line->istate == 1) return 1;
 	} else if (!strcmp(env->syntax->name,"java")) {
 		if (line->istate == 1) return 1;
+	} else if (!strcmp(env->syntax->name,"kotlin")) {
+		if (line->istate == 1) return 1;
 	} else if (!strcmp(env->syntax->name,"rust")) {
 		if (line->istate > 0) return 1;
 	}
 
 	return 0;
+}
+
+int find_brace_line_start(int line, int col) {
+	int ncol = col - 1;
+	while (ncol > 0) {
+		if (env->lines[line-1]->text[ncol-1].codepoint == ')') {
+			int t_line_no = env->line_no;
+			int t_col_no = env->col_no;
+			env->line_no = line;
+			env->col_no = ncol;
+			int paren_match_line = -1, paren_match_col = -1;
+			find_matching_paren(&paren_match_line, &paren_match_col, 1);
+
+			if (paren_match_line != -1) {
+				line = paren_match_line;
+			}
+
+			env->line_no = t_line_no;
+			env->col_no = t_col_no;
+			break;
+		} else if (env->lines[line-1]->text[ncol-1].codepoint == ' ') {
+			ncol--;
+		} else {
+			break;
+		}
+	}
+	return line;
 }
 
 /**
@@ -1787,15 +2019,23 @@ void add_indent(int new_line, int old_line, int ignore_brace) {
 				}
 			}
 		} else {
-			for (int i = 0; i < env->lines[old_line]->actual; ++i) {
-				if (old_line < new_line && i == env->lines[old_line]->actual - 3 &&
-					env->lines[old_line]->text[i].codepoint == ' ' &&
-					env->lines[old_line]->text[i+1].codepoint == '*' &&
-					env->lines[old_line]->text[i+2].codepoint == '/') {
+			int line_to_copy_from = old_line;
+			int col;
+			if (old_line < new_line &&
+				!ignore_brace &&
+				(col = line_ends_with_brace(env->lines[old_line])) &&
+				env->lines[old_line]->text[col-1].codepoint == '{') {
+				line_to_copy_from = find_brace_line_start(old_line+1, col)-1;
+			}
+			for (int i = 0; i < env->lines[line_to_copy_from]->actual; ++i) {
+				if (line_to_copy_from < new_line && i == env->lines[line_to_copy_from]->actual - 3 &&
+					env->lines[line_to_copy_from]->text[i].codepoint == ' ' &&
+					env->lines[line_to_copy_from]->text[i+1].codepoint == '*' &&
+					env->lines[line_to_copy_from]->text[i+2].codepoint == '/') {
 					break;
-				} else if (env->lines[old_line]->text[i].codepoint == ' ' ||
-					env->lines[old_line]->text[i].codepoint == '\t') {
-					env->lines[new_line] = line_insert(env->lines[new_line],env->lines[old_line]->text[i],i,new_line);
+				} else if (env->lines[line_to_copy_from]->text[i].codepoint == ' ' ||
+					env->lines[line_to_copy_from]->text[i].codepoint == '\t') {
+					env->lines[new_line] = line_insert(env->lines[new_line],env->lines[line_to_copy_from]->text[i],i,new_line);
 					env->col_no++;
 					changed = 1;
 				} else {
@@ -1977,6 +2217,33 @@ void place_cursor(int x, int y) {
 	printf("\033[%d;%dH", y, x);
 }
 
+char * color_string(const char * fg, const char * bg) {
+	static char output[100];
+	char * t = output;
+	t += sprintf(t,"\033[22;23;24;");
+	if (*bg == '@') {
+		int _bg = atoi(bg+1);
+		if (_bg < 10) {
+			t += sprintf(t, "4%d;", _bg);
+		} else {
+			t += sprintf(t, "10%d;", _bg-10);
+		}
+	} else {
+		t += sprintf(t, "48;%s;", bg);
+	}
+	if (*fg == '@') {
+		int _fg = atoi(fg+1);
+		if (_fg < 10) {
+			t += sprintf(t, "3%dm", _fg);
+		} else {
+			t += sprintf(t, "9%dm", _fg-10);
+		}
+	} else {
+		t += sprintf(t, "38;%sm", fg);
+	}
+	return output;
+}
+
 /**
  * Set text colors
  *
@@ -1987,27 +2254,7 @@ void place_cursor(int x, int y) {
  * color modes.
  */
 void set_colors(const char * fg, const char * bg) {
-	printf("\033[22;23;24;");
-	if (*bg == '@') {
-		int _bg = atoi(bg+1);
-		if (_bg < 10) {
-			printf("4%d;", _bg);
-		} else {
-			printf("10%d;", _bg-10);
-		}
-	} else {
-		printf("48;%s;", bg);
-	}
-	if (*fg == '@') {
-		int _fg = atoi(fg+1);
-		if (_fg < 10) {
-			printf("3%dm", _fg);
-		} else {
-			printf("9%dm", _fg-10);
-		}
-	} else {
-		printf("38;%sm", fg);
-	}
+	printf("%s", color_string(fg, bg));
 }
 
 /**
@@ -2134,6 +2381,9 @@ void restore_cursor(void) {
 void mouse_enable(void) {
 	if (global_config.can_mouse) {
 		printf("\033[?1000h");
+		if (global_config.use_sgr_mouse) {
+			printf("\033[?1006h");
+		}
 	}
 }
 
@@ -2142,6 +2392,9 @@ void mouse_enable(void) {
  */
 void mouse_disable(void) {
 	if (global_config.can_mouse) {
+		if (global_config.use_sgr_mouse) {
+			printf("\033[?1006l");
+		}
 		printf("\033[?1000l");
 	}
 }
@@ -2158,6 +2411,16 @@ void shift_up(int amount) {
  */
 void shift_down(int amount) {
 	printf("\033[%dT", amount);
+}
+
+void insert_lines_at(int line, int count) {
+	place_cursor(1, line);
+	printf("\033[%dL", count);
+}
+
+void delete_lines_at(int line, int count) {
+	place_cursor(1, line);
+	printf("\033[%dM", count);
 }
 
 /**
@@ -2179,6 +2442,24 @@ void unset_alternate_screen(void) {
 }
 
 /**
+ * Enable bracketed paste mode.
+ */
+void set_bracketed_paste(void) {
+	if (global_config.can_bracketedpaste) {
+		printf("\033[?2004h");
+	}
+}
+
+/**
+ * Disable bracketed paste mode.
+ */
+void unset_bracketed_paste(void) {
+	if (global_config.can_bracketedpaste) {
+		printf("\033[?2004l");
+	}
+}
+
+/**
  * Get the name of just a file from a full path.
  * Returns a pointer within the original string.
  */
@@ -2191,15 +2472,63 @@ char * file_basename(char * file) {
 /**
  * Print a tab name with fixed width and modifiers
  * into an output buffer and return the written width.
- *
- * TODO this isn't unicode/display-width aware, so it returns
- *      byte lengths and doesn't limit the width of the file
- *      properly if it has wide characters. FIXME
  */
-int draw_tab_name(buffer_t * _env, char * out) {
-	return sprintf(out, "%s %.40s ",
-		_env->modified ? " +" : "",
-		_env->file_name ? file_basename(_env->file_name) : "[No Name]");
+int draw_tab_name(buffer_t * _env, char * out, int max_width, int * width) {
+	uint32_t c, state = 0;
+	char * t = _env->file_name ? file_basename(_env->file_name) : "[No Name]";
+
+#define ADD(c) do { \
+	*o = c; \
+	o++; \
+	*o = '\0'; \
+	bytes++; \
+} while (0)
+
+	char * o = out;
+	*o = '\0';
+
+	int bytes = 0;
+
+	if (max_width < 2) return 1;
+
+	ADD(' ');
+	(*width)++;
+
+	if (_env->modified) {
+		if (max_width < 4) return 1;
+		ADD('+');
+		(*width)++;
+		ADD(' ');
+		(*width)++;
+	}
+
+	while (*t) {
+		if (!decode(&state, &c, (unsigned char)*t)) {
+
+			char tmp[7];
+			int size = to_eight(c, tmp);
+			if (bytes + size > 62) break;
+			if (*width + size >= max_width) return 1;
+
+			for (int i = 0; i < size; ++i) {
+				ADD(tmp[i]);
+			}
+
+			(*width) += codepoint_width(c);
+
+		} else if (state == UTF8_REJECT) {
+			state = 0;
+		}
+		t++;
+	}
+
+	if (max_width == *width + 1) return 1;
+
+	ADD(' ');
+	(*width)++;
+
+#undef ADD
+	return 0;
 }
 
 /**
@@ -2208,6 +2537,7 @@ int draw_tab_name(buffer_t * _env, char * out) {
  * The active buffer is highlighted.
  */
 void redraw_tabbar(void) {
+	if (!global_config.tabs_visible) return;
 	/* Hide cursor while rendering UI */
 	hide_cursor();
 
@@ -2218,7 +2548,14 @@ void redraw_tabbar(void) {
 
 	/* For each buffer... */
 	int offset = 0;
-	for (int i = 0; i < buffers_len; i++) {
+
+	if (global_config.tab_offset) {
+		set_colors(COLOR_NUMBER_FG, COLOR_NUMBER_BG);
+		printf("<");
+		offset++;
+	}
+
+	for (int i = global_config.tab_offset; i < buffers_len; i++) {
 		buffer_t * _env = buffers[i];
 
 		if (_env == env) {
@@ -2234,16 +2571,22 @@ void redraw_tabbar(void) {
 		}
 
 		char title[64];
-		int size = draw_tab_name(_env, title);
+		int size = 0;
+		int filled = draw_tab_name(_env, title, global_config.term_width - offset, &size);
 
-		if (offset + size >= global_config.term_width) {
-			if (global_config.term_width - offset - 1 > 0) {
-				printf("%*s", global_config.term_width - offset - 1, title);
-			}
-			break;
-		} else {
+		if (filled) {
+			offset += size;
 			printf("%s", title);
+			set_colors(COLOR_NUMBER_FG, COLOR_NUMBER_BG);
+			while (offset != global_config.term_width - 1) {
+				printf(" ");
+				offset++;
+			}
+			printf(">");
+			break;
 		}
+
+		printf("%s", title);
 
 		offset += size;
 	}
@@ -2389,16 +2732,9 @@ void render_line(line_t * line, int width, int offset, int line_no) {
 			/* Render special characters */
 			if (c.codepoint == '\t') {
 				_set_colors(COLOR_ALT_FG, COLOR_ALT_BG);
-				if (global_config.can_unicode) {
-					printf("»");
-					for (int i = 1; i < c.display_width; ++i) {
-						printf("·");
-					}
-				} else {
-					printf(">");
-					for (int i = 1; i < c.display_width; ++i) {
-						printf("-");
-					}
+				printf("%s", global_config.tab_indicator);
+				for (int i = 1; i < c.display_width; ++i) {
+					printf("%s" ,global_config.space_indicator);
 				}
 				_set_colors(last_color ? last_color : COLOR_FG, COLOR_BG);
 			} else if (c.codepoint < 32) {
@@ -2437,11 +2773,7 @@ void render_line(line_t * line, int width, int offset, int line_no) {
 			} else if (c.codepoint == ' ' && i == line->actual - 1) {
 				/* Special case: space at end of line */
 				_set_colors(COLOR_ALT_FG, COLOR_ALT_BG);
-				if (global_config.can_unicode) {
-					printf("·");
-				} else {
-					printf("-");
-				}
+				printf("%s",global_config.space_indicator);
 				_set_colors(COLOR_FG, COLOR_BG);
 			} else {
 				/* Normal characters get output */
@@ -2505,6 +2837,29 @@ void render_line(line_t * line, int width, int offset, int line_no) {
 		set_colors(COLOR_FG, COLOR_BG);
 	}
 
+	if (env->maxcolumn && line_no > -1 /* ensures we don't do this for command line */) {
+
+		/* Fill out the normal background */
+		if (j < offset) j = offset;
+		for (; j < width + offset && j < env->maxcolumn; ++j) {
+			printf(" ");
+		}
+
+		/* Draw the line */
+		if (j < width + offset && j == env->maxcolumn) {
+			j++;
+			set_colors(COLOR_ALT_FG, COLOR_ALT_BG);
+			if (global_config.can_unicode) {
+				printf("▏");
+			} else {
+				printf("|");
+			}
+		}
+
+		/* Fill the rest with the alternate background color */
+		set_colors(COLOR_ALT_FG, COLOR_ALT_BG);
+	}
+
 	if (env->left + env->width == global_config.term_width && global_config.can_bce) {
 		clear_to_end();
 	} else {
@@ -2520,17 +2875,24 @@ void render_line(line_t * line, int width, int offset, int line_no) {
  * Get the width of the line number region
  */
 int num_width(void) {
-	if (!global_config.numbers) return -2; /* Accounts for the padding */
-	int w = log_base_10(env->line_count) + 1;
-	if (w < 2) return 2;
+	if (!env->numbers) return 0;
+	int w = log_base_10(env->line_count) + 3;
+	if (w < 4) return 4;
 	return w;
+}
+
+/**
+ * Display width of the revision status gutter.
+ */
+int gutter_width(void) {
+	return env->gutter;
 }
 
 /**
  * Draw the gutter and line numbers.
  */
 void draw_line_number(int x) {
-	if (!global_config.numbers) return;
+	if (!env->numbers) return;
 	/* Draw the line number */
 	if (env->lines[x]->is_current) {
 		set_colors(COLOR_NUMBER_BG, COLOR_NUMBER_FG);
@@ -2541,7 +2903,7 @@ void draw_line_number(int x) {
 		x = x+1 - env->line_no;
 		x = ((x < 0) ? -x : x)-1;
 	}
-	int num_size = num_width();
+	int num_size = num_width() - 2; /* Padding */
 	for (int y = 0; y < num_size - log_base_10(x + 1); ++y) {
 		printf(" ");
 	}
@@ -2571,7 +2933,7 @@ void recalculate_current_line(void) {
 	if (something_changed && global_config.relative_lines) {
 		for (int i = env->offset; i < env->offset + global_config.term_height - global_config.bottom_size - 1 && i < env->line_count; ++i) {
 			/* Place cursor for line number */
-			place_cursor(2 + env->left, (i)-env->offset+2);
+			place_cursor(1 + gutter_width() + env->left, (i)-env->offset + 1 + global_config.tabs_visible);
 			draw_line_number(i);
 		}
 	}
@@ -2586,7 +2948,7 @@ void redraw_line(int x) {
 	if (env->loading) return;
 
 	/* Determine if this line is visible. */
-	if (x - env->offset < 0 || x - env->offset > global_config.term_height - global_config.bottom_size - 2) {
+	if (x - env->offset < 0 || x - env->offset > global_config.term_height - global_config.bottom_size - 1 - global_config.tabs_visible) {
 		return;
 	}
 
@@ -2597,34 +2959,36 @@ void redraw_line(int x) {
 	hide_cursor();
 
 	/* Move cursor to upper left most cell of this line */
-	place_cursor(1 + env->left,2 + j);
+	place_cursor(1 + env->left,1 + global_config.tabs_visible + j);
 
 	/* Draw a gutter on the left. */
-	switch (env->lines[x]->rev_status) {
-		case 1:
-			set_colors(COLOR_NUMBER_FG, COLOR_GREEN);
-			printf(" ");
-			break;
-		case 2:
-			set_colors(COLOR_NUMBER_FG, global_config.color_gutter ? COLOR_SEARCH_BG : COLOR_ALT_FG);
-			printf(" ");
-			break;
-		case 3:
-			set_colors(COLOR_NUMBER_FG, COLOR_KEYWORD);
-			printf(" ");
-			break;
-		case 4:
-			set_colors(COLOR_ALT_FG, COLOR_RED);
-			printf("▆");
-			break;
-		case 5:
-			set_colors(COLOR_KEYWORD, COLOR_RED);
-			printf("▆");
-			break;
-		default:
-			set_colors(COLOR_NUMBER_FG, COLOR_ALT_FG);
-			printf(" ");
-			break;
+	if (env->gutter) {
+		switch (env->lines[x]->rev_status) {
+			case 1:
+				set_colors(COLOR_NUMBER_FG, COLOR_GREEN);
+				printf(" ");
+				break;
+			case 2:
+				set_colors(COLOR_NUMBER_FG, global_config.color_gutter ? COLOR_SEARCH_BG : COLOR_ALT_FG);
+				printf(" ");
+				break;
+			case 3:
+				set_colors(COLOR_NUMBER_FG, COLOR_KEYWORD);
+				printf(" ");
+				break;
+			case 4:
+				set_colors(COLOR_ALT_FG, COLOR_RED);
+				printf("▆");
+				break;
+			case 5:
+				set_colors(COLOR_KEYWORD, COLOR_RED);
+				printf("▆");
+				break;
+			default:
+				set_colors(COLOR_NUMBER_FG, COLOR_ALT_FG);
+				printf(" ");
+				break;
+		}
 	}
 
 	draw_line_number(x);
@@ -2634,7 +2998,7 @@ void redraw_line(int x) {
 	 * If this is the active line, the current character cell offset should be used.
 	 * (Non-active lines are not shifted and always render from the start of the line)
 	 */
-	render_line(env->lines[x], env->width - 3 - num_width(), (x + 1 == env->line_no || global_config.horizontal_shift_scrolling) ? env->coffset : 0, x+1);
+	render_line(env->lines[x], env->width - gutter_width() - num_width(), (x + 1 == env->line_no || global_config.horizontal_shift_scrolling) ? env->coffset : 0, x+1);
 
 }
 
@@ -2642,7 +3006,7 @@ void redraw_line(int x) {
  * Draw a ~ line where there is no buffer text.
  */
 void draw_excess_line(int j) {
-	place_cursor(1+env->left,2 + j);
+	place_cursor(1+env->left,1 + global_config.tabs_visible + j);
 	paint_line(COLOR_ALT_BG);
 	set_colors(COLOR_ALT_FG, COLOR_ALT_BG);
 	printf("~");
@@ -2660,11 +3024,14 @@ void draw_excess_line(int j) {
  * Redraw the entire text area
  */
 void redraw_text(void) {
+	if (!env) return;
+	if (!global_config.has_terminal) return;
+
 	/* Hide cursor while rendering */
 	hide_cursor();
 
 	/* Figure out the available size of the text region */
-	int l = global_config.term_height - global_config.bottom_size - 1;
+	int l = global_config.term_height - global_config.bottom_size - global_config.tabs_visible;
 	int j = 0;
 
 	/* Draw each line */
@@ -2723,6 +3090,68 @@ void redraw_alt_buffer(buffer_t * buf) {
 }
 
 /**
+ * Basically wcswidth() but implemented internally using our
+ * own utf-8 decoder to ensure it works properly.
+ */
+int display_width_of_string(char * str) {
+	uint8_t * s = (uint8_t *)str;
+
+	int out = 0;
+	uint32_t c, state = 0;
+	while (*s) {
+		if (!decode(&state, &c, *s)) {
+			out += codepoint_width(c);
+		} else if (state == UTF8_REJECT) {
+			state = 0;
+		}
+		s++;
+	}
+
+	return out;
+}
+
+int statusbar_append_status(int *remaining_width, char * output, char * base, ...) {
+	va_list args;
+	va_start(args, base);
+	char tmp[100]; /* should be big enough */
+	vsnprintf(tmp, 100, base, args);
+	va_end(args);
+
+	int width = display_width_of_string(tmp) + 2;
+
+	if (width < *remaining_width) {
+		strcat(output,color_string(COLOR_STATUS_ALT, COLOR_STATUS_BG));
+		strcat(output,"[");
+		strcat(output,color_string(COLOR_STATUS_FG, COLOR_STATUS_BG));
+		strcat(output, tmp);
+		strcat(output,color_string(COLOR_STATUS_ALT, COLOR_STATUS_BG));
+		strcat(output,"]");
+		(*remaining_width) -= width;
+		return width;
+	} else {
+		return 0;
+	}
+}
+
+int statusbar_build_right(char * right_hand) {
+	char tmp[1024];
+	sprintf(tmp, " Line %d/%d Col: %d ", env->line_no, env->line_count, env->col_no);
+	int out = display_width_of_string(tmp);
+	char * s = right_hand;
+
+	s += sprintf(s, "%s", color_string(COLOR_STATUS_ALT, COLOR_STATUS_BG));
+	s += sprintf(s, " Line ");
+	s += sprintf(s, "%s", color_string(COLOR_STATUS_FG, COLOR_STATUS_BG));
+	s += sprintf(s, "%d/%d ", env->line_no, env->line_count);
+	s += sprintf(s, "%s", color_string(COLOR_STATUS_ALT, COLOR_STATUS_BG));
+	s += sprintf(s, " Col: ");
+	s += sprintf(s, "%s", color_string(COLOR_STATUS_FG, COLOR_STATUS_BG));
+	s += sprintf(s, "%d ", env->col_no);
+
+	return out;
+}
+
+/**
  * Draw the status bar
  *
  * The status bar shows the name of the file, whether it has modifications,
@@ -2731,6 +3160,8 @@ void redraw_alt_buffer(buffer_t * buf) {
  * The right side of the tatus bar shows the line number and column.
  */
 void redraw_statusbar(void) {
+	if (global_config.hide_statusbar) return;
+	if (!env) return;
 	/* Hide cursor while rendering */
 	hide_cursor();
 
@@ -2741,58 +3172,76 @@ void redraw_statusbar(void) {
 	paint_line(COLOR_STATUS_BG);
 	set_colors(COLOR_STATUS_FG, COLOR_STATUS_BG);
 
-	/* Print the file name */
-	char status_bits[1024] = {0}; /* Sane maximum */
-	char * s = status_bits;
 
+	/* Pre-render the right hand side of the status bar */
+	char right_hand[1024];
+	int right_width = statusbar_build_right(right_hand);
+
+	char status_bits[1024] = {0}; /* Sane maximum */
+	int status_bits_width = 0;
+
+	int remaining_width = global_config.term_width - right_width;
+
+#define ADD(...) do { status_bits_width += statusbar_append_status(&remaining_width, status_bits, __VA_ARGS__); } while (0)
 	if (env->syntax) {
-		s += snprintf(s, 100, "[%s]", env->syntax->name);
+		ADD("%s",env->syntax->name);
 	}
 
 	/* Print file status indicators */
 	if (env->modified) {
-		s += snprintf(s, 5, "[+]");
+		ADD("+");
 	}
 
 	if (env->readonly) {
-		s += snprintf(s, 6, "[ro]");
+		ADD("ro");
 	}
 
 	if (env->crnl) {
-		s += snprintf(s, 7, "[crnl]");
+		ADD("crnl");
 	}
 
 	if (env->tabs) {
-		s += snprintf(s, 20, "[tabs]");
+		ADD("tabs");
 	} else {
-		s += snprintf(s, 20, "[spaces=%d]", env->tabstop);
+		ADD("spaces=%d", env->tabstop);
 	}
 
 	if (global_config.yanks) {
-		s += snprintf(s, 20, "[y:%ld]", global_config.yank_count);
+		ADD("y:%ld", global_config.yank_count);
 	}
 
 	if (env->indent) {
-		s += snprintf(s, 20, "[indent]");
+		ADD("indent");
 	}
 
-	/* Pre-render the right hand side of the status bar */
-	char right_hand[1024];
-	snprintf(right_hand, 1024, "Line %d/%d Col: %d ", env->line_no, env->line_count, env->col_no);
+	if (global_config.smart_complete) {
+		ADD("complete");
+	}
 
-	if (env->file_name) {
-		int len = strlen(env->file_name);
-		int i = 0;
-		while (len > 5 && len > (int)global_config.term_width - (int)strlen(right_hand) - (int)strlen(status_bits) - 5) {
-			len--;
-			i += 1;
+#undef ADD
+
+	uint8_t * file_name = (uint8_t *)(env->file_name ? env->file_name : "[No Name]");
+	int file_name_width = display_width_of_string((char*)file_name);
+
+	if (remaining_width > 3) {
+		int is_chopped = 0;
+		while (remaining_width < file_name_width + 3) {
+			is_chopped = 1;
+			if ((*file_name & 0xc0) == 0xc0) { /* First byte of a multibyte character */
+				file_name++;
+				while ((*file_name & 0xc0) == 0x80) file_name++;
+			} else {
+				file_name++;
+			}
+			file_name_width = display_width_of_string((char*)file_name);
 		}
-		printf("%s%s", i > 0 ? "<" : "", env->file_name + i);
-	} else {
-		printf("[No Name]");
+		if (is_chopped) {
+			set_colors(COLOR_ALT_FG, COLOR_STATUS_BG);
+			printf("<");
+		}
+		set_colors(COLOR_STATUS_FG, COLOR_STATUS_BG);
+		printf("%s ", file_name);
 	}
-
-	printf(" ");
 
 	printf("%s", status_bits);
 
@@ -2800,8 +3249,8 @@ void redraw_statusbar(void) {
 	clear_to_end();
 
 	/* Move the cursor appropriately to draw it */
-	place_cursor(global_config.term_width - strlen(right_hand), global_config.term_height - 1);
-	/* TODO: What if we're localized and this has wide chars? */
+	place_cursor(global_config.term_width - right_width, global_config.term_height - 1);
+	set_colors(COLOR_STATUS_FG, COLOR_STATUS_BG);
 	printf("%s",right_hand);
 }
 
@@ -2825,6 +3274,8 @@ void redraw_nav_buffer() {
  * or shows the INSERT (or VISUAL in the future) mode name.
  */
 void redraw_commandline(void) {
+	if (!env) return;
+
 	/* Hide cursor while rendering */
 	hide_cursor();
 
@@ -2923,6 +3374,7 @@ void render_commandline_message(char * message, ...) {
 BIM_ACTION(redraw_all, 0,
 	"Repaint the screen."
 )(void) {
+	if (!env) return;
 	redraw_tabbar();
 	redraw_text();
 	if (left_buffer) {
@@ -3005,6 +3457,7 @@ void set_modified(void) {
  * Draw a message on the status line
  */
 void render_status_message(char * message, ...) {
+	if (!env) return; /* Don't print when there's no active environment; this usually means a bimrc command tried to print something */
 	/* varargs setup */
 	va_list args;
 	va_start(args, message);
@@ -3043,21 +3496,25 @@ void render_error(char * message, ...) {
 	vsnprintf(buf, 1024, message, args);
 	va_end(args);
 
-	/* Hide cursor while rendering */
-	hide_cursor();
+	if (env) {
+		/* Hide cursor while rendering */
+		hide_cursor();
 
-	/* Move cursor to the command line */
-	place_cursor(1, global_config.term_height);
+		/* Move cursor to the command line */
+		place_cursor(1, global_config.term_height);
 
-	/* Set appropriate error message colors */
-	set_colors(COLOR_ERROR_FG, COLOR_ERROR_BG);
+		/* Set appropriate error message colors */
+		set_colors(COLOR_ERROR_FG, COLOR_ERROR_BG);
 
-	/* Draw the message */
-	printf("%s", buf);
+		/* Draw the message */
+		printf("%s", buf);
+	} else {
+		printf("bim: error during startup: %s\n", buf);
+	}
+
 }
 
 char * paren_pairs = "()[]{}<>";
-void find_matching_paren(int * out_line, int * out_col, int in_col);
 
 int is_paren(int c) {
 	char * p = paren_pairs;
@@ -3069,6 +3526,7 @@ int is_paren(int c) {
 }
 
 #define _rehighlight_parens() do { \
+	if (i < 0 || i >= env->line_count) break; \
 	for (int j = 0; j < env->lines[i]->actual; ++j) { \
 		if (i == line-1 && j == col-1) { \
 			env->lines[line-1]->text[col-1].flags |= FLAG_SELECT; \
@@ -3115,8 +3573,12 @@ void highlight_matching_paren(void) {
  */
 void unhighlight_matching_paren(void) {
 	if (env->highlighting_paren > 0 && env->highlighting_paren <= env->line_count) {
-		recalculate_syntax(env->lines[env->highlighting_paren-1], env->highlighting_paren-1);
-		redraw_line(env->highlighting_paren-1);
+		for (int i = env->highlighting_paren - 1; i <= env->highlighting_paren + 1; ++i) {
+			if (i >= 1 && i <= env->line_count) {
+				recalculate_syntax(env->lines[i-1], i-1);
+				redraw_line(i-1);
+			}
+		}
 		env->highlighting_paren = -1;
 	}
 }
@@ -3135,7 +3597,7 @@ void place_cursor_actual(void) {
 	if (env->col_no  < 1) env->col_no  = 1;
 
 	/* Account for the left hand gutter */
-	int num_size = num_width() + 3;
+	int num_size = num_width() + gutter_width();
 	int x = num_size + 1 - env->coffset;
 
 	/* Determine where the cursor is physically */
@@ -3155,7 +3617,7 @@ void place_cursor_actual(void) {
 		needs_redraw = 1;
 	}
 
-	while (y > global_config.term_height - global_config.bottom_size - global_config.cursor_padding) {
+	while (y > 1 + global_config.term_height - global_config.bottom_size - global_config.cursor_padding - global_config.tabs_visible) {
 		y--;
 		env->offset++;
 		needs_redraw = 1;
@@ -3189,7 +3651,7 @@ void place_cursor_actual(void) {
 	recalculate_current_line();
 
 	/* Move the actual terminal cursor */
-	place_cursor(x+env->left,y);
+	place_cursor(x+env->left,y - !global_config.tabs_visible);
 
 	/* Show the cursor */
 	show_cursor();
@@ -3259,6 +3721,7 @@ void SIGTSTP_handler(int sig) {
 	reset();
 	clear_screen();
 	show_cursor();
+	unset_bracketed_paste();
 	unset_alternate_screen();
 	fflush(stdout);
 
@@ -3269,6 +3732,7 @@ void SIGTSTP_handler(int sig) {
 void SIGCONT_handler(int sig) {
 	(void)sig;
 	set_alternate_screen();
+	set_bracketed_paste();
 	set_unbuffered();
 	update_screen_size();
 	mouse_enable();
@@ -3404,6 +3868,7 @@ void set_syntax_by_name(const char * name) {
 				env->lines[i]->text[j].flags = 0;
 			}
 		}
+		env->syntax = NULL;
 		redraw_all();
 		return;
 	}
@@ -3560,6 +4025,19 @@ int line_matches(line_t * line, char * string) {
 	return 1;
 }
 
+void run_onload(buffer_t * env) {
+	if (has_function("onload:*")) {
+		run_function("onload:*");
+	}
+	if (env->syntax) {
+		char tmp[512];
+		sprintf(tmp, "onload:%s", env->syntax->name);
+		if (has_function(tmp)) {
+			run_function(tmp);
+		}
+	}
+}
+
 /**
  * Create a new buffer from a file.
  */
@@ -3596,12 +4074,24 @@ void open_file(char * file) {
 			init_line = atoi(l);
 		}
 
+		char * _file = file;
+
+		if (file[0] == '~') {
+			char * home = getenv("HOME");
+			if (home) {
+				_file = malloc(strlen(file) + strlen(home) + 4); /* Paranoia */
+				sprintf(_file, "%s%s", home, file+1);
+			}
+		}
+
 		struct stat statbuf;
-		if (!stat(file, &statbuf) && S_ISDIR(statbuf.st_mode)) {
-			read_directory_into_buffer(file);
+		if (!stat(_file, &statbuf) && S_ISDIR(statbuf.st_mode)) {
+			read_directory_into_buffer(_file);
+			if (file != _file) free(_file);
 			return;
 		}
-		f = fopen(file, "r");
+		f = fopen(_file, "r");
+		if (file != _file) free(_file);
 		env->file_name = strdup(file);
 	}
 
@@ -3616,6 +4106,7 @@ void open_file(char * file) {
 		if (env->syntax && env->syntax->prefers_spaces) {
 			env->tabs = 0;
 		}
+		run_onload(env);
 		return;
 	}
 
@@ -3669,6 +4160,8 @@ void open_file(char * file) {
 	}
 	if (spaces > tabs) {
 		env->tabs = 0;
+	} else if (spaces == tabs && env->syntax) {
+		env->tabs = env->syntax->prefers_spaces;
 	}
 
 	/* TODO figure out tabstop for spaces? */
@@ -3698,6 +4191,8 @@ void open_file(char * file) {
 	}
 
 	fclose(f);
+
+	run_onload(env);
 }
 
 /**
@@ -3709,6 +4204,7 @@ void quit(const char * message) {
 	reset();
 	clear_screen();
 	show_cursor();
+	unset_bracketed_paste();
 	unset_alternate_screen();
 	if (message) {
 		fprintf(stdout, "%s\n", message);
@@ -3742,7 +4238,9 @@ void try_quit(void) {
 /**
  * Switch to the previous buffer
  */
-void previous_tab(void) {
+BIM_ACTION(previous_tab, 0,
+	"Switch the previoius tab"
+)(void) {
 	buffer_t * last = NULL;
 	for (int i = 0; i < buffers_len; i++) {
 		buffer_t * _env = buffers[i];
@@ -3769,7 +4267,9 @@ void previous_tab(void) {
 /**
  * Switch to the next buffer
  */
-void next_tab(void) {
+BIM_ACTION(next_tab, 0,
+	"Switch to the next tab"
+)(void) {
 	for (int i = 0; i < buffers_len; i++) {
 		buffer_t * _env = buffers[i];
 		if (_env == env) {
@@ -3889,24 +4389,10 @@ int git_examine(char * filename) {
 	return 0;
 }
 
-
 /**
- * Write active buffer to file
+ * Write file contents to FILE
  */
-void write_file(char * file) {
-	if (!file) {
-		render_error("Need a file to write to.");
-		return;
-	}
-
-	FILE * f = fopen(file, "w+");
-
-	if (!f) {
-		render_error("Failed to open file for writing.");
-		return;
-	}
-
-	/* Go through each line and convert it back to UTF-8 */
+void output_file(buffer_t * env, FILE * f) {
 	int i, j;
 	for (i = 0; i < env->line_count; ++i) {
 		line_t * line = env->lines[i];
@@ -3925,6 +4411,27 @@ void write_file(char * file) {
 		if (env->crnl) fputc('\r', f);
 		fputc('\n', f);
 	}
+}
+
+/**
+ * Write active buffer to file
+ */
+void write_file(char * file) {
+	if (!file) {
+		render_error("Need a file to write to.");
+		return;
+	}
+
+	FILE * f = fopen(file, "w+");
+
+	if (!f) {
+		render_error("Failed to open file for writing.");
+		return;
+	}
+
+	/* Go through each line and convert it back to UTF-8 */
+	output_file(env, f);
+
 	fclose(f);
 
 	/* Mark it no longer modified */
@@ -4043,15 +4550,20 @@ BIM_ACTION(cursor_down, 0,
 		}
 
 		/* If we've scrolled past the bottom of the screen, scroll the screen */
-		if (env->line_no > env->offset + global_config.term_height - global_config.bottom_size - 1 - global_config.cursor_padding) {
+		if (env->line_no > env->offset + global_config.term_height - global_config.bottom_size - global_config.tabs_visible - global_config.cursor_padding) {
 			env->offset += 1;
 
 			/* Tell terminal to scroll */
 			if (global_config.can_scroll && !left_buffer) {
-				shift_up(1);
+				if (!global_config.can_insert) {
+					shift_up(1);
+					redraw_tabbar();
+				} else {
+					delete_lines_at(global_config.tabs_visible ? 2 : 1, 1);
+				}
 
 				/* A new line appears on screen at the bottom, draw it */
-				int l = global_config.term_height - global_config.bottom_size - 1;
+				int l = global_config.term_height - global_config.bottom_size - global_config.tabs_visible;
 				if (env->offset + l < env->line_count + 1) {
 					redraw_line(env->offset + l-1);
 				} else {
@@ -4060,7 +4572,6 @@ BIM_ACTION(cursor_down, 0,
 			} else {
 				redraw_text();
 			}
-			redraw_tabbar();
 			redraw_statusbar();
 			redraw_commandline();
 			place_cursor_actual();
@@ -4134,7 +4645,12 @@ BIM_ACTION(cursor_up, 0,
 
 			/* Tell terminal to scroll */
 			if (global_config.can_scroll && !left_buffer) {
-				shift_down(1);
+				if (!global_config.can_insert) {
+					shift_down(1);
+					redraw_tabbar();
+				} else {
+					insert_lines_at(global_config.tabs_visible ? 2 : 1, 1);
+				}
 
 				/*
 				 * The line at the top of the screen should always be real
@@ -4142,9 +4658,9 @@ BIM_ACTION(cursor_up, 0,
 				 */
 				redraw_line(env->offset);
 			} else {
+				redraw_tabbar();
 				redraw_text();
 			}
-			redraw_tabbar();
 			redraw_statusbar();
 			redraw_commandline();
 			place_cursor_actual();
@@ -4268,7 +4784,48 @@ int subsearch_matches(line_t * line, int j, uint32_t * needle, int ignorecase, i
 			match++;
 			continue;
 		}
-		if (*match == '\\' && (match[1] == '$' || match[1] == '^' || match[1] == '/' || match[1] == '\\')) {
+		if (*match == '.') {
+			if (match[1] == '*') {
+				int greedy = !(match[2] == '?');
+				/* Short-circuit chained .*'s */
+				if (match[greedy ? 2 : 3] == '.' && match[greedy ? 3 : 4] == '*') {
+					int _len;
+					if (subsearch_matches(line, k, &match[greedy ? 2 : 3], ignorecase, &_len)) {
+						if (len) *len = _len + k - j;
+						return 1;
+					}
+					return 0;
+				}
+				int _j = greedy ? line->actual : k;
+				int _break = -1;
+				int _len = -1;
+				if (!match[greedy ? 2 : 3]) {
+					_len = greedy ? (line->actual - _j) : 0;
+					_break = _j;
+				} else {
+					while (_j < line->actual + 1 && _j >= k) {
+						int len;
+						if (subsearch_matches(line, _j, &match[greedy ? 2 : 3], ignorecase, &len)) {
+							_break = _j;
+							_len = len;
+							break;
+						}
+						_j += (greedy ? -1 : 1);
+					}
+				}
+				if (_break != -1) {
+					if (len) *len = (_break - j) + _len;
+					return 1;
+				}
+				return 0;
+			} else {
+				if (k >= line->actual) return 0;
+				match++;
+				k++;
+				continue;
+			}
+		}
+		if (*match == '\\' && (match[1] == '$' || match[1] == '^' || match[1] == '/' || match[1] == '\\' || match[1] == '.')) {
 			match++;
 		} else if (*match == '\\' && match[1] == 't') {
 			if (line->text[k].codepoint != '\t') break;
@@ -4419,11 +4976,7 @@ static void html_convert_color(const char * color_string) {
 	}
 }
 
-/**
- * Based on vim's :TOhtml
- * Convert syntax-highlighted buffer contents to HTML.
- */
-BIM_COMMAND(tohtml,"tohtml","Convert the document to an HTML representation with syntax highlighting.") {
+int convert_to_html(void) {
 	buffer_t * old = env;
 	env = buffer_new();
 	setup_buffer(env);
@@ -4608,8 +5161,18 @@ BIM_COMMAND(tohtml,"tohtml","Convert the document to an HTML representation with
 	for (int i = 0; i < env->line_count; ++i) {
 		recalculate_syntax(env->lines[i],i);
 	}
-	redraw_all();
 
+	return 0;
+}
+
+/**
+ * Based on vim's :TOhtml
+ * Convert syntax-highlighted buffer contents to HTML.
+ */
+BIM_COMMAND(tohtml,"tohtml","Convert the document to an HTML representation with syntax highlighting.") {
+	convert_to_html();
+
+	redraw_all();
 	return 0;
 }
 
@@ -4877,6 +5440,7 @@ BIM_COMMAND(e,"e","Open a file") {
 		SWAP(line_t **, env->lines, new_env->lines);
 		SWAP(int, env->line_count, new_env->line_count);
 		SWAP(int, env->line_avail, new_env->line_avail);
+		SWAP(history_t *, env->history, new_env->history);
 
 		buffer_close(new_env); /* Should probably also free, this needs editing. */
 		redraw_all();
@@ -4973,7 +5537,59 @@ BIM_COMMAND(tabn,"tabn","Next tab") {
 	return 0;
 }
 
+BIM_COMMAND(tabindicator,"tabindicator","Set the tab indicator") {
+	if (argc < 2) {
+		render_status_message("tabindicator=%s", global_config.tab_indicator);
+		return 0;
+	}
+	if (display_width_of_string(argv[1]) != 1) {
+		render_error("Can't set '%s' as indicator, must be one cell wide.", argv[1]);
+		return 1;
+	}
+	if (global_config.tab_indicator) free(global_config.tab_indicator);
+	global_config.tab_indicator = strdup(argv[1]);
+	return 0;
+}
+
+BIM_COMMAND(spaceindicator,"spaceindicator","Set the space indicator") {
+	if (argc < 2) {
+		render_status_message("spaceindicator=%s", global_config.space_indicator);
+		return 0;
+	}
+	if (display_width_of_string(argv[1]) != 1) {
+		render_error("Can't set '%s' as indicator, must be one cell wide.", argv[1]);
+		return 1;
+	}
+	if (global_config.space_indicator) free(global_config.space_indicator);
+	global_config.space_indicator = strdup(argv[1]);
+	return 0;
+}
+
+BIM_COMMAND(global_sgr,"global.sgr_mouse","Enable SGR mouse escapes") {
+	if (argc < 2) {
+		render_status_message("global.sgr_mouse=%d", global_config.use_sgr_mouse);
+	} else {
+		if (global_config.has_terminal) mouse_disable();
+		global_config.use_sgr_mouse = !!atoi(argv[1]);
+		if (global_config.has_terminal) mouse_enable();
+	}
+	return 0;
+}
+
+BIM_COMMAND(global_git,"global.git","Show or change the default status of git integration") {
+	if (argc < 2) {
+		render_status_message("global.git=%d", global_config.check_git);
+	} else {
+		global_config.check_git = !!atoi(argv[1]);
+	}
+	return 0;
+}
+
 BIM_COMMAND(git,"git","Show or change status of git integration") {
+	if (!env) {
+		render_error("requires environment (did you mean global.git?)");
+		return 1;
+	}
 	if (argc < 2) {
 		render_status_message("git=%d", env->checkgitstatusonwrite);
 	} else {
@@ -5005,6 +5621,17 @@ BIM_COMMAND(indent,"indent","Enable smart indentation") {
 BIM_COMMAND(noindent,"noindent","Disable smrat indentation") {
 	env->indent = 0;
 	redraw_statusbar();
+	return 0;
+}
+
+/* TODO: global.maxcolumn */
+BIM_COMMAND(maxcolumn,"maxcolumn","Highlight past the given column to indicate maximum desired line length") {
+	if (argc < 2) {
+		render_status_message("maxcolumn=%d",env->maxcolumn);
+		return 0;
+	}
+	env->maxcolumn = atoi(argv[1]);
+	redraw_text();
 	return 0;
 }
 
@@ -5082,13 +5709,23 @@ BIM_COMMAND(version,"version","Show version information.") {
 	return 0;
 }
 
+void load_colorscheme_script(const char * name) {
+	static char name_copy[512];
+	char tmp[1024];
+	snprintf(tmp, 1023, "theme:%s", name);
+	if (!run_function(tmp)) {
+		sprintf(name_copy, "%s", name);
+		current_theme = name_copy;
+	}
+}
+
 BIM_COMMAND(theme,"theme","Set color theme") {
 	if (argc < 2) {
 		render_status_message("theme=%s", current_theme);
 	} else {
 		for (struct theme_def * d = themes; themes && d->name; ++d) {
 			if (!strcmp(argv[1], d->name)) {
-				d->load();
+				d->load(d->name);
 				redraw_all();
 				return 0;
 			}
@@ -5227,7 +5864,9 @@ BIM_COMMAND(padding,"padding","Show or set cursor padding when scrolling vertica
 		render_status_message("padding=%d", global_config.cursor_padding);
 	} else {
 		global_config.cursor_padding = atoi(argv[1]);
-		place_cursor_actual();
+		if (env) {
+			place_cursor_actual();
+		}
 	}
 	return 0;
 }
@@ -5237,7 +5876,7 @@ BIM_COMMAND(smartcase,"smartcase","Show or set the status of the smartcase searc
 		render_status_message("smartcase=%d", global_config.smart_case);
 	} else {
 		global_config.smart_case = atoi(argv[1]);
-		place_cursor_actual();
+		if (env) place_cursor_actual();
 	}
 	return 0;
 }
@@ -5247,11 +5886,13 @@ BIM_COMMAND(hlparen,"hlparen","Show or set the configuration option to highlight
 		render_status_message("hlparen=%d", global_config.highlight_parens);
 	} else {
 		global_config.highlight_parens = atoi(argv[1]);
-		for (int i = 0; i < env->line_count; ++i) {
-			recalculate_syntax(env->lines[i],i);
+		if (env) {
+			for (int i = 0; i < env->line_count; ++i) {
+				recalculate_syntax(env->lines[i],i);
+			}
+			redraw_text();
+			place_cursor_actual();
 		}
-		redraw_text();
-		place_cursor_actual();
 	}
 	return 0;
 }
@@ -5261,13 +5902,15 @@ BIM_COMMAND(hlcurrent,"hlcurrent","Show or set the configuration option to highl
 		render_status_message("hlcurrent=%d", global_config.highlight_current_line);
 	} else {
 		global_config.highlight_current_line = atoi(argv[1]);
-		if (!global_config.highlight_current_line) {
-			for (int i = 0; i < env->line_count; ++i) {
-				env->lines[i]->is_current = 0;
+		if (env) {
+			if (!global_config.highlight_current_line) {
+				for (int i = 0; i < env->line_count; ++i) {
+					env->lines[i]->is_current = 0;
+				}
 			}
+			redraw_text();
+			place_cursor_actual();
 		}
-		redraw_text();
-		place_cursor_actual();
 	}
 	return 0;
 }
@@ -5282,11 +5925,61 @@ BIM_COMMAND(crnl,"crnl","Show or set the line ending mode") {
 	return 0;
 }
 
-BIM_COMMAND(numbers,"numbers","Show or set the display of line numbers") {
+BIM_COMMAND(global_numbers,"global.numbers","Set whether numbers are displayed by default") {
 	if (argc < 2) {
-		render_status_message("numbers=%d", global_config.numbers);
+		render_status_message("global.numbers=%d", global_config.numbers);
 	} else {
 		global_config.numbers = !!atoi(argv[1]);
+		redraw_all();
+	}
+	return 0;
+}
+
+BIM_COMMAND(global_statusbar,"global.statusbar","Show or set whether to display the statusbar") {
+	if (argc < 2) {
+		render_status_message("global.statusbar=%d",!global_config.hide_statusbar);
+	} else {
+		global_config.hide_statusbar = !atoi(argv[1]);
+		global_config.bottom_size = global_config.hide_statusbar ? 1 : 2;
+		redraw_all();
+	}
+	return 0;
+}
+
+BIM_COMMAND(global_search_wraps,"wrapsearch","Enable search wrapping around from top or bottom") {
+	if (argc < 2) {
+		render_status_message("wrapsearch=%d",global_config.search_wraps);
+	} else {
+		global_config.search_wraps = !!atoi(argv[1]);
+	}
+	return 0;
+}
+
+BIM_COMMAND(smartcomplete,"smartcomplete","Enable autocompletion while typing") {
+	if (argc < 2) {
+		render_status_message("smartcomplete=%d",global_config.smart_complete);
+	} else {
+		global_config.smart_complete = !!atoi(argv[1]);
+	}
+	return 0;
+}
+
+BIM_COMMAND(global_autohide_tabs,"global.autohidetabs","Whether to show the tab bar when there is only one tab") {
+	if (argc < 2) {
+		render_status_message("global.autohidetabs=%d", global_config.autohide_tabs);
+	} else {
+		global_config.autohide_tabs = !!atoi(argv[1]);
+		global_config.tabs_visible = (!global_config.autohide_tabs) || (buffers_len > 1);
+		redraw_all();
+	}
+	return 0;
+}
+
+BIM_COMMAND(numbers,"numbers","Show or set the display of line numbers") {
+	if (argc < 2) {
+		render_status_message("numbers=%d", env->numbers);
+	} else {
+		env->numbers = !!atoi(argv[1]);
 		redraw_all();
 	}
 	return 0;
@@ -5297,13 +5990,15 @@ BIM_COMMAND(relativenumbers,"relativenumbers","Show or set the display of relati
 		render_status_message("relativenumber=%d", global_config.relative_lines);
 	} else {
 		global_config.relative_lines = atoi(argv[1]);
-		if (!global_config.relative_lines) {
-			for (int i = 0; i < env->line_count; ++i) {
-				env->lines[i]->is_current = 0;
+		if (env) {
+			if (!global_config.relative_lines) {
+				for (int i = 0; i < env->line_count; ++i) {
+					env->lines[i]->is_current = 0;
+				}
 			}
+			redraw_text();
+			place_cursor_actual();
 		}
-		redraw_text();
-		place_cursor_actual();
 	}
 	return 0;
 }
@@ -5329,16 +6024,15 @@ BIM_COMMAND(keyname,"keyname","Press and key and get its name.") {
 /**
  * Process a user command.
  */
-void process_command(char * cmd) {
-	/* Add command to history */
-	insert_command_history(cmd);
+int process_command(char * cmd) {
+
+	if (*cmd == '#') return 0;
 
 	/* First, check prefix commands */
 	for (struct command_def * c = prefix_commands; prefix_commands && c->name; ++c) {
 		if (strstr(cmd, c->name) == cmd &&
 		    (!isalpha(cmd[strlen(c->name)]) || !isalpha(cmd[0]))) {
-			c->command(cmd, 0, NULL);
-			return;
+			return c->command(cmd, 0, NULL);
 		}
 	}
 
@@ -5361,14 +6055,13 @@ void process_command(char * cmd) {
 
 	if (argc < 1) {
 		/* no op */
-		return;
+		return 0;
 	}
 
 	/* Now check regular commands */
 	for (struct command_def * c = regular_commands; regular_commands && c->name; ++c) {
 		if (!strcmp(argv[0], c->name)) {
-			c->command(cmd, argc, argv);
-			return;
+			return c->command(cmd, argc, argv);
 		}
 	}
 
@@ -5376,12 +6069,16 @@ void process_command(char * cmd) {
 
 	if (argv[0][0] == '-' && isdigit(argv[0][1])) {
 		goto_line(env->line_no-atoi(&argv[0][1]));
+		return 0;
 	} else if (argv[0][0] == '+' && isdigit(argv[0][1])) {
 		goto_line(env->line_no+atoi(&argv[0][1]));
+		return 0;
 	} else if (isdigit(*argv[0])) {
 		goto_line(atoi(argv[0]));
+		return 0;
 	} else {
 		render_error("Not an editor command: %s", argv[0]);
+		return 1;
 	}
 }
 
@@ -5447,6 +6144,8 @@ void command_tab_complete(char * buffer) {
 		} \
 	} while (0)
 
+	int _candidates_are_files = 0;
+
 	if (arg == 0 || (arg == 1 && !strcmp(args[0], "help"))) {
 		/* Complete command names */
 		for (struct command_def * c = regular_commands; regular_commands && c->name; ++c) {
@@ -5476,7 +6175,70 @@ void command_tab_complete(char * buffer) {
 		goto _accept_candidate;
 	}
 
-	if (arg == 1 && (!strcmp(args[0], "e") || !strcmp(args[0], "tabnew") || !strcmp(args[0],"split") || !strcmp(args[0],"w"))) {
+	if (arg == 1 && (!strcmp(args[0], "setcolor"))) {
+		for (struct ColorName * c = color_names; c->name; ++c) {
+			add_candidate(c->name);
+		}
+		goto _accept_candidate;
+	}
+
+	if (arg == 1 && (!strcmp(args[0], "action"))) {
+		for (struct action_def * a = mappable_actions; a->name; ++a) {
+			add_candidate(a->name);
+		}
+		goto _accept_candidate;
+	}
+
+	if (arg == 1 && (!strcmp(args[0], "call") || !strcmp(args[0], "trycall") || !strcmp(args[0], "showfunction"))) {
+		for (int i = 0; i < flex_user_functions_count; ++i) {
+			add_candidate(user_functions[i]->command);
+		}
+		goto _accept_candidate;
+	}
+
+	if (arg == 1 && (!strcmp(args[0], "mapkey"))) {
+		for (int i = 0; args[arg][i]; ++i) {
+			if (args[arg][i] == ' ') {
+				while (args[arg][i] == ' ') {
+					args[arg][i] = '\0';
+					i++;
+				}
+				start = &args[arg][i];
+				arg++;
+				args[arg] = start;
+				i = 0;
+				if (arg == 32) {
+					arg = 31;
+					break;
+				}
+			}
+		}
+
+		if (arg == 1) {
+			for (struct mode_names * m = mode_names; m->name; ++m) {
+				add_candidate(m->name);
+			}
+		} else if (arg == 2) {
+			for (unsigned int i = 0;  i < sizeof(KeyNames)/sizeof(KeyNames[0]); ++i) {
+				add_candidate(KeyNames[i].name);
+			}
+		} else if (arg == 3) {
+			for (struct action_def * a = mappable_actions; a->name; ++a) {
+				add_candidate(a->name);
+			}
+			add_candidate("none");
+		} else if (arg == 4) {
+			for (char * c = "racnwmb"; *c; ++c) {
+				char tmp[] = {*c,'\0'};
+				add_candidate(tmp);
+			}
+		}
+		goto _accept_candidate;
+	}
+
+	if (arg == 1 && (!strcmp(args[0], "e") || !strcmp(args[0], "tabnew") ||
+	    !strcmp(args[0],"split") || !strcmp(args[0],"w") || !strcmp(args[0],"runscript") ||
+	    !strcmp(args[0],"rundir") || args[0][0] == '!')) {
 		/* Complete file paths */
 
 		/* First, find the deepest directory match */
@@ -5489,7 +6251,15 @@ void command_tab_complete(char * buffer) {
 				/* Started with slash, and it was the only slash */
 				dirp = opendir("/");
 			} else {
-				dirp = opendir(tmp);
+				char * home;
+				if (*tmp == '~' && (home = getenv("HOME"))) {
+					char * t = malloc(strlen(tmp) + strlen(home) + 4);
+					sprintf(t, "%s%s",home,tmp+1);
+					dirp = opendir(t);
+					free(t);
+				} else {
+					dirp = opendir(tmp);
+				}
 			}
 		} else {
 			/* No directory match, completing from current directory */
@@ -5503,14 +6273,23 @@ void command_tab_complete(char * buffer) {
 			goto done;
 		}
 
+		_candidates_are_files = 1;
+
 		struct dirent * ent = readdir(dirp);
 		while (ent != NULL) {
 			if (ent->d_name[0] != '.' || (last_slash ? (last_slash[1] == '.') : (tmp[0] == '.'))) {
 				struct stat statbuf;
 				/* Figure out if this file is a directory */
 				if (last_slash) {
-					char * x = malloc(strlen(tmp) + 1 + strlen(ent->d_name) + 1);
-					snprintf(x, strlen(tmp) + 1 + strlen(ent->d_name) + 1, "%s/%s",tmp,ent->d_name);
+					char * x;
+					char * home;
+					if (tmp[0] == '~' && (home = getenv("HOME"))) {
+						x = malloc(strlen(tmp) + 1 + strlen(ent->d_name) + 1 + strlen(home) + 1);
+						snprintf(x, strlen(tmp) + 1 + strlen(ent->d_name) + 1 + strlen(home) + 1, "%s%s/%s",home,tmp+1,ent->d_name);
+					} else {
+						x = malloc(strlen(tmp) + 1 + strlen(ent->d_name) + 1);
+						snprintf(x, strlen(tmp) + 1 + strlen(ent->d_name) + 1, "%s/%s",tmp,ent->d_name);
+					}
 					stat(x, &statbuf);
 					free(x);
 				} else {
@@ -5577,7 +6356,15 @@ _accept_candidate:
 		memset(tmp, 0, global_config.term_width+1);
 		int offset = 0;
 		for (int i = 0; i < candidate_count; ++i) {
-			if (offset + 1 + (signed)strlen(candidates[i]) > global_config.term_width - 5) {
+			char * printed_candidate = candidates[i];
+			if (_candidates_are_files) {
+				for (char * c = printed_candidate; *c; ++c) {
+					if (c[0] == '/' && c[1] != '\0') {
+						printed_candidate = c+1;
+					}
+				}
+			}
+			if (offset + 1 + (signed)strlen(printed_candidate) > global_config.term_width - 5) {
 				strcat(tmp, "...");
 				break;
 			}
@@ -5585,8 +6372,8 @@ _accept_candidate:
 				strcat(tmp, " ");
 				offset++;
 			}
-			strcat(tmp, candidates[i]);
-			offset += strlen(candidates[i]);
+			strcat(tmp, printed_candidate);
+			offset += strlen(printed_candidate);
 		}
 		render_status_message("%s", tmp);
 		free(tmp);
@@ -5667,7 +6454,7 @@ done:
 	while (*t) { \
 		if (!decode(&state, &c, *t)) { \
 			char_t _c = {codepoint_width(c), 0, c}; \
-			line_insert(global_config.command_buffer, _c, global_config.command_col_no - 1, -1); \
+			global_config.command_buffer = line_insert(global_config.command_buffer, _c, global_config.command_col_no - 1, -1); \
 			global_config.command_col_no++; \
 		} else if (state == UTF8_REJECT) state = 0; \
 		t++; \
@@ -5807,6 +6594,7 @@ BIM_ACTION(command_accept, 0,
 
 	/* Run the converted command */
 	global_config.break_from_selection = 0;
+	insert_command_history(tmp);
 	process_command(tmp);
 	free(tmp);
 
@@ -6065,7 +6853,6 @@ void rehighlight_search(line_t * line) {
 			for (int i = j; matchlen > 0; ++i, matchlen--) {
 				line->text[i].flags |= FLAG_SEARCH;
 			}
-			break;
 		}
 		j++;
 	}
@@ -6179,6 +6966,7 @@ BIM_ACTION(search_next, 0,
 	find_match(env->line_no, env->col_no+1, &line, &col, global_config.search, NULL);
 
 	if (line == -1) {
+		if (!global_config.search_wraps) return;
 		find_match(1,1, &line, &col, global_config.search, NULL);
 		if (line == -1) return;
 	}
@@ -6201,6 +6989,7 @@ BIM_ACTION(search_prev, 0,
 	find_match_backwards(env->line_no, env->col_no-1, &line, &col, global_config.search);
 
 	if (line == -1) {
+		if (!global_config.search_wraps) return;
 		find_match_backwards(env->line_count, env->lines[env->line_count-1]->actual, &line, &col, global_config.search);
 		if (line == -1) return;
 	}
@@ -6319,16 +7108,7 @@ BIM_ACTION(use_right_buffer, 0,
 	update_title();
 }
 
-/**
- * Handle mouse event
- */
-BIM_ACTION(handle_mouse, 0,
-	"Process mouse actions."
-)(void) {
-	int buttons = bim_getch() - 32;
-	int x = bim_getch() - 32;
-	int y = bim_getch() - 32;
-
+void handle_common_mouse(int buttons, int x, int y) {
 	if (buttons == 64) {
 		/* Scroll up */
 		if (global_config.shift_scrolling) {
@@ -6337,7 +7117,7 @@ BIM_ACTION(handle_mouse, 0,
 			for (int i = 0; i < global_config.scroll_amount; ++i) {
 				if (env->offset > 0) {
 					env->offset--;
-					if (env->line_no > env->offset + global_config.term_height - global_config.bottom_size - 1 - global_config.cursor_padding) {
+					if (env->line_no > env->offset + global_config.term_height - global_config.bottom_size - global_config.tabs_visible - global_config.cursor_padding) {
 						cursor_up();
 					}
 					shifted++;
@@ -6346,14 +7126,19 @@ BIM_ACTION(handle_mouse, 0,
 			env->loading = 0;
 			if (!shifted) return;
 			if (global_config.can_scroll && !left_buffer) {
-				shift_down(shifted);
+				if (!global_config.can_insert) {
+					shift_down(shifted);
+					redraw_tabbar();
+				} else {
+					insert_lines_at(global_config.tabs_visible ? 2 : 1, shifted);
+				}
 				for (int i = 0; i < shifted; ++i) {
 					redraw_line(env->offset+i);
 				}
 			} else {
+				redraw_tabbar();
 				redraw_text();
 			}
-			redraw_tabbar();
 			redraw_statusbar();
 			redraw_commandline();
 			place_cursor_actual();
@@ -6381,8 +7166,13 @@ BIM_ACTION(handle_mouse, 0,
 			env->loading = 0;
 			if (!shifted) return;
 			if (global_config.can_scroll && !left_buffer) {
-				shift_up(shifted);
-				int l = global_config.term_height - global_config.bottom_size - 1;
+				if (!global_config.can_insert) {
+					shift_up(shifted);
+					redraw_tabbar();
+				} else {
+					delete_lines_at(global_config.tabs_visible ? 2 : 1, shifted);
+				}
+				int l = global_config.term_height - global_config.bottom_size - global_config.tabs_visible;
 				for (int i = 0; i < shifted; ++i) {
 					if (env->offset + l - i < env->line_count + 1) {
 						redraw_line(env->offset + l-1-i);
@@ -6391,9 +7181,9 @@ BIM_ACTION(handle_mouse, 0,
 					}
 				}
 			} else {
+				redraw_tabbar();
 				redraw_text();
 			}
-			redraw_tabbar();
 			redraw_statusbar();
 			redraw_commandline();
 			place_cursor_actual();
@@ -6409,14 +7199,22 @@ BIM_ACTION(handle_mouse, 0,
 		if (x < 0) return;
 		if (y < 0) return;
 
-		if (y == 1) {
+		if (y == 1 && global_config.tabs_visible) {
 			/* Pick from tabs */
-			int _x = 0;
 			if (env->mode != MODE_NORMAL && env->mode != MODE_INSERT) return; /* Don't let the tab be switched in other modes for now */
-			for (int i = 0; i < buffers_len; i++) {
+			int _x = 0;
+			if (global_config.tab_offset) _x = 1;
+			if (global_config.tab_offset && _x >= x) {
+				global_config.tab_offset--;
+				redraw_tabbar();
+				return;
+			}
+			for (int i = global_config.tab_offset; i < buffers_len; i++) {
 				buffer_t * _env = buffers[i];
 				char tmp[64];
-				_x += draw_tab_name(_env, tmp);
+				int size = 0;
+				int filled = draw_tab_name(_env, tmp, global_config.term_width - _x, &size);
+				_x += size;
 				if (_x >= x) {
 					if (left_buffer && buffers[i] != left_buffer && buffers[i] != right_buffer) unsplit();
 					env = buffers[i];
@@ -6424,6 +7222,11 @@ BIM_ACTION(handle_mouse, 0,
 					update_title();
 					return;
 				}
+				if (filled) break;
+			}
+			if (x > _x && global_config.tab_offset < buffers_len - 1) {
+				global_config.tab_offset++;
+				redraw_tabbar();
 			}
 			return;
 		}
@@ -6444,7 +7247,7 @@ BIM_ACTION(handle_mouse, 0,
 		}
 
 		/* Figure out y coordinate */
-		int line_no = y + env->offset - 1;
+		int line_no = y + env->offset - global_config.tabs_visible;
 		int col_no = -1;
 
 		if (line_no > env->line_count) {
@@ -6456,7 +7259,7 @@ BIM_ACTION(handle_mouse, 0,
 		}
 
 		/* Account for the left hand gutter */
-		int num_size = num_width() + 3;
+		int num_size = num_width() + gutter_width();
 		int _x = num_size - (line_no == env->line_no ? env->coffset : 0);
 
 		/* Determine where the cursor is physically */
@@ -6482,6 +7285,65 @@ BIM_ACTION(handle_mouse, 0,
 	}
 	return;
 }
+
+/**
+ * Handle mouse event
+ */
+BIM_ACTION(handle_mouse, 0,
+	"Process mouse actions."
+)(void) {
+	int buttons = bim_getch() - 32;
+	int x = bim_getch() - 32;
+	int y = bim_getch() - 32;
+
+	handle_common_mouse(buttons, x, y);
+}
+
+BIM_ACTION(handle_mouse_sgr, 0,
+	"Process SGR-style mouse actions."
+)(void) {
+	int values[3] = {0};
+	char tmp[512] = {0};
+	char * c = tmp;
+	int buttons = 0;
+	do {
+		int _c = bim_getch();
+		if (_c == -1) {
+			break;
+		}
+		if (_c == 'm') {
+			buttons = 3;
+			break;
+		} else if (_c == 'M') {
+			buttons = 0;
+			break;
+		}
+		*c = _c;
+		++c;
+	} while (1);
+	char * j = tmp;
+	char * last = tmp;
+	int i = 0;
+	while (*j) {
+		if (*j == ';') {
+			*j = '\0';
+			values[i] = atoi(last);
+			last = j+1;
+			i++;
+			if (i == 3) break;
+		}
+		j++;
+	}
+	if (last && i < 3) values[i] = atoi(last);
+	if (buttons != 3) {
+		buttons = values[0];
+	}
+	int x = values[1];
+	int y = values[2];
+
+	handle_common_mouse(buttons, x, y);
+}
+
 
 BIM_ACTION(insert_char, ARG_IS_INPUT | ACTION_IS_RW,
 	"Insert one character."
@@ -7746,12 +8608,6 @@ BIM_ACTION(insert_at_end_of_selection, ACTION_IS_RW,
 	env->mode = MODE_INSERT;
 }
 
-struct completion_match {
-	char * string;
-	char * file;
-	char * search;
-};
-
 void free_completion_match(struct completion_match * match) {
 	if (match->string) free(match->string);
 	if (match->file) free(match->file);
@@ -7762,54 +8618,43 @@ void free_completion_match(struct completion_match * match) {
  * Read ctags file to find matches for a symbol
  */
 int read_tags(uint32_t * comp, struct completion_match **matches, int * matches_count, int complete_match) {
-	int matches_len = 4;
+	int _matches_len = 4;
+	int *matches_len = &_matches_len;
 	*matches_count = 0;
-	*matches = malloc(sizeof(struct completion_match) * (matches_len));
+	*matches = malloc(sizeof(struct completion_match) * (*matches_len));
 
 	FILE * tags = fopen("tags","r");
-	if (!tags) return 1;
-	char tmp[4096]; /* max line */
-	while (!feof(tags) && fgets(tmp, 4096, tags)) {
-		if (tmp[0] == '!') continue;
-		int i = 0;
-		while (comp[i] && comp[i] == (unsigned int)tmp[i]) i++;
-		if (comp[i] == '\0') {
-			if (complete_match && tmp[i] != '\t') continue;
-			int j = i;
-			while (tmp[j] != '\t' && tmp[j] != '\n' && tmp[j] != '\0') j++;
-			tmp[j] = '\0'; j++;
-			char * file = &tmp[j];
-			while (tmp[j] != '\t' && tmp[j] != '\n' && tmp[j] != '\0') j++;
-			tmp[j] = '\0'; j++;
-			char * search = &tmp[j];
-			while (!(tmp[j] == '/' && tmp[j+1] == ';' && tmp[j+2] == '"' && tmp[j+3] == '\t') /* /normal searches/ */
-			       && !(tmp[j] == ';' && tmp[j+1] == '"' && tmp[j+2] == '\t') /* Old ctags line number searches */
-			       && (tmp[j] != '\n' && tmp[j] != '\0')) j++;
-			tmp[j] = '\0'; j++;
+	if (tags) {
+		char tmp[4096]; /* max line */
+		while (!feof(tags) && fgets(tmp, 4096, tags)) {
+			if (tmp[0] == '!') continue;
+			int i = 0;
+			while (comp[i] && comp[i] == (unsigned int)tmp[i]) i++;
+			if (comp[i] == '\0') {
+				if (complete_match && tmp[i] != '\t') continue;
+				int j = i;
+				while (tmp[j] != '\t' && tmp[j] != '\n' && tmp[j] != '\0') j++;
+				tmp[j] = '\0'; j++;
+				char * file = &tmp[j];
+				while (tmp[j] != '\t' && tmp[j] != '\n' && tmp[j] != '\0') j++;
+				tmp[j] = '\0'; j++;
+				char * search = &tmp[j];
+				while (!(tmp[j] == '/' && tmp[j+1] == ';' && tmp[j+2] == '"' && tmp[j+3] == '\t') /* /normal searches/ */
+				       && !(tmp[j] == ';' && tmp[j+1] == '"' && tmp[j+2] == '\t') /* Old ctags line number searches */
+				       && (tmp[j] != '\n' && tmp[j] != '\0')) j++;
+				tmp[j] = '\0'; j++;
 
-			/* Dedup */
-			#if 0
-			int match_found = 0;
-			for (int i = 0; i < *matches_count; ++i) {
-				if (!strcmp((*matches)[i].string, tmp)) {
-					match_found = 1;
-					break;
-				}
+				add_match(tmp,file,search);
 			}
-			if (match_found) continue;
-			#endif
-
-			if (*matches_count == matches_len) {
-				matches_len *= 2;
-				*matches = realloc(*matches, sizeof(struct completion_match) * (matches_len));
-			}
-			(*matches)[*matches_count].string = strdup(tmp);
-			(*matches)[*matches_count].file = strdup(file);
-			(*matches)[*matches_count].search = strdup(search);
-			(*matches_count)++;
 		}
+		fclose(tags);
 	}
-	fclose(tags);
+
+	/* TODO: Get these from syntax files with a dynamic callback */
+	if (env->syntax && env->syntax->completion_matcher) {
+		env->syntax->completion_matcher(comp,matches,matches_count,complete_match,matches_len);
+	}
+
 	return 0;
 }
 
@@ -7829,11 +8674,11 @@ void draw_completion_matches(uint32_t * tmp, struct completion_match *matches, i
 	}
 
 	/* Figure out how much space we have to display the window */
-	int cursor_y = env->line_no - env->offset + 1;
-	int max_y = global_config.term_height - 2 - cursor_y;
+	int cursor_y = env->line_no - env->offset + global_config.tabs_visible;
+	int max_y = global_config.term_height - global_config.bottom_size - cursor_y;
 
 	/* Find a good place to put the box horizontally */
-	int num_size = num_width() + 3;
+	int num_size = num_width() + gutter_width();
 	int x = num_size + 1 - env->coffset;
 
 	/* Determine where the cursor is physically */
@@ -7844,10 +8689,10 @@ void draw_completion_matches(uint32_t * tmp, struct completion_match *matches, i
 
 	int box_width = max_width;
 	int box_x = x;
-	int box_y = cursor_y+1;
-	if (max_width > env->width - num_width()) {
-		box_width = env->width - num_width();
-		box_x = 1;
+	int box_y = cursor_y + 1;
+	if (max_width > env->width - num_width() - gutter_width()) {
+		box_width = env->width - num_width() - gutter_width();
+		box_x = num_width() + gutter_width() + 1;
 	} else if (env->width - x < max_width) {
 		box_width = max_width;
 		box_x = env->width - max_width;
@@ -7857,7 +8702,7 @@ void draw_completion_matches(uint32_t * tmp, struct completion_match *matches, i
 
 	for (int x = index; x < max_count+index; ++x) {
 		int i = x % matches_count;
-		place_cursor(box_x, box_y+x-index);
+		place_cursor(box_x + env->left, box_y+x-index);
 		set_colors(COLOR_KEYWORD, COLOR_STATUS_BG);
 		/* TODO wide characters */
 		int match_width = strlen(matches[i].string);
@@ -7871,11 +8716,11 @@ void draw_completion_matches(uint32_t * tmp, struct completion_match *matches, i
 		}
 	}
 	if (max_count == 0) {
-		place_cursor(box_x, box_y);
+		place_cursor(box_x + env->left, box_y);
 		set_colors(COLOR_STATUS_FG, COLOR_STATUS_BG);
 		printf(" (no matches) ");
 	} else if (max_count != matches_count) {
-		place_cursor(box_x, box_y+max_count);
+		place_cursor(box_x + env->left, box_y+max_count);
 		set_colors(COLOR_STATUS_FG, COLOR_STATUS_BG);
 		printf(" (%d more) ", matches_count-max_count);
 	}
@@ -7884,17 +8729,25 @@ void draw_completion_matches(uint32_t * tmp, struct completion_match *matches, i
 /**
  * Autocomplete words (function/variable names, etc.) in input mode.
  */
-int omni_complete(void) {
+int omni_complete(int quit_quietly_on_none) {
 	int c;
+
+	int (*qualifier)(int c) = simple_keyword_qualifier;
+	if (env->syntax && env->syntax->completion_qualifier) {
+		qualifier = env->syntax->completion_qualifier;
+	}
 
 	/* Pull the word from before the cursor */
 	int c_before = 0;
 	int i = env->col_no-1;
 	while (i > 0) {
-		if (!simple_keyword_qualifier(env->lines[env->line_no-1]->text[i-1].codepoint)) break;
+		int c = env->lines[env->line_no-1]->text[i-1].codepoint;
+		if (!qualifier(c)) break;
 		c_before++;
 		i--;
 	}
+
+	if (!c_before && quit_quietly_on_none) return 0;
 
 	/* Populate with characters */
 	uint32_t * tmp = malloc(sizeof(uint32_t) * (c_before+1));
@@ -7919,6 +8772,7 @@ int omni_complete(void) {
 	if (read_tags(tmp, &matches, &matches_count, 0)) goto _completion_done;
 
 	/* Draw box with matches at cursor-width(tmp) */
+	if (quit_quietly_on_none && matches_count == 0) return 0;
 	draw_completion_matches(tmp, matches, matches_count, 0);
 
 	int retval = 0;
@@ -8173,7 +9027,7 @@ BIM_ACTION(delete_forward, ACTION_IS_RW,
 	if (env->col_no <= env->lines[env->line_no-1]->actual) {
 		line_delete(env->lines[env->line_no-1], env->col_no, env->line_no-1);
 		redraw_text();
-	} else if (env->col_no == env->lines[env->line_no-1]->actual + 1) {
+	} else if (env->col_no == env->lines[env->line_no-1]->actual + 1 && env->line_count > env->line_no) {
 		merge_lines(env->lines, env->line_no);
 		redraw_text();
 	}
@@ -8282,7 +9136,15 @@ BIM_ACTION(enter_replace, ACTION_IS_RW,
 BIM_ACTION(toggle_numbers, 0,
 	"Toggle the display of line numbers."
 )(void) {
-	global_config.numbers = !global_config.numbers;
+	env->numbers = !env->numbers;
+	redraw_all();
+	place_cursor_actual();
+}
+
+BIM_ACTION(toggle_gutter, 0,
+	"Toggle the display of the revision status gutter."
+)(void) {
+	env->gutter = !env->gutter;
 	redraw_all();
 	place_cursor_actual();
 }
@@ -8291,6 +9153,14 @@ BIM_ACTION(toggle_indent, 0,
 	"Toggle smart indentation."
 )(void) {
 	env->indent = !env->indent;
+	redraw_statusbar();
+	place_cursor_actual();
+}
+
+BIM_ACTION(toggle_smartcomplete, 0,
+	"Toggle smart completion."
+)(void) {
+	global_config.smart_complete = !global_config.smart_complete;
 	redraw_statusbar();
 	place_cursor_actual();
 }
@@ -8413,7 +9283,7 @@ BIM_ACTION(perform_omni_completion, ACTION_IS_RW,
 	"(temporary) Perform smart symbol competion from ctags."
 )(void) {
 	/* This should probably be a submode */
-	while (omni_complete() == 1);
+	while (omni_complete(0) == 1);
 }
 
 BIM_ACTION(smart_tab, ACTION_IS_RW,
@@ -8465,6 +9335,7 @@ BIM_ACTION(smart_brace_end, ARG_IS_INPUT | ACTION_IS_RW,
 			env->col_no--;
 			find_matching_paren(&line,&col, 1);
 			if (line != -1) {
+				line = find_brace_line_start(line, col);
 				while (env->lines[env->line_no-1]->actual) {
 					line_delete(env->lines[env->line_no-1], env->lines[env->line_no-1]->actual, env->line_no-1);
 				}
@@ -8501,22 +9372,23 @@ BIM_ACTION(shift_horizontally, ARG_IS_CUSTOM,
 	redraw_text();
 }
 
-struct action_map {
-	int key;
-	void (*method)();
-	int options;
-	int arg;
-};
+static int state_before_paste = 0;
+BIM_ACTION(paste_begin, 0, "Begin bracketed paste; disable indentation, completion, etc.")(void) {
+	if (global_config.smart_complete) state_before_paste |= 0x01;
+	if (env->indent) state_before_paste |= 0x02;
 
-#define opt_rep  0x1 /* This action will be repeated */
-#define opt_arg  0x2 /* This action will take a specified argument */
-#define opt_char 0x4 /* This action will read a character to pass as an argument */
-#define opt_nav  0x8 /* This action will consume the nav buffer as its argument */
-#define opt_rw   0x10 /* Must not be read-only */
-#define opt_norm 0x20 /* Returns to normal mode */
-#define opt_byte 0x40 /* Same as opt_char but forces a byte */
+	global_config.smart_complete = 0;
+	env->indent = 0;
+	/* TODO: We need env->loading == 1, but with history (manual breaks, though) */
+}
 
-struct action_map NORMAL_MAP[] = {
+BIM_ACTION(paste_end, 0, "End bracketed paste; restore indentation, completion, etc.")(void) {
+	if (state_before_paste & 0x01) global_config.smart_complete = 1;
+	if (state_before_paste & 0x02) env->indent = 1;
+	redraw_statusbar();
+}
+
+struct action_map _NORMAL_MAP[] = {
 	{KEY_BACKSPACE, cursor_left_with_wrap, opt_rep, 0},
 	{'V',           enter_line_selection, 0, 0},
 	{'v',           enter_char_selection, 0, 0},
@@ -8538,10 +9410,12 @@ struct action_map NORMAL_MAP[] = {
 	{'R',           enter_replace, opt_rw, 0},
 	{KEY_SHIFT_UP,   enter_line_selection_and_cursor_up, 0, 0},
 	{KEY_SHIFT_DOWN, enter_line_selection_and_cursor_down, 0, 0},
+	{KEY_ALT_UP,    previous_tab, 0, 0},
+	{KEY_ALT_DOWN,  next_tab, 0, 0},
 	{-1, NULL, 0, 0},
 };
 
-struct action_map INSERT_MAP[] = {
+struct action_map _INSERT_MAP[] = {
 	{KEY_ESCAPE,    leave_insert, 0, 0},
 	{KEY_DELETE,    delete_forward, 0, 0},
 	{KEY_CTRL_C,    leave_insert, 0, 0},
@@ -8553,10 +9427,12 @@ struct action_map INSERT_MAP[] = {
 	{'\t',          smart_tab, 0, 0},
 	{'/',           smart_comment_end, opt_arg, '/'},
 	{'}',           smart_brace_end, opt_arg, '}'},
+	{KEY_PASTE_BEGIN, paste_begin, 0, 0},
+	{KEY_PASTE_END, paste_end, 0, 0},
 	{-1, NULL, 0, 0},
 };
 
-struct action_map REPLACE_MAP[] = {
+struct action_map _REPLACE_MAP[] = {
 	{KEY_ESCAPE,    leave_insert, 0, 0},
 	{KEY_DELETE,    delete_forward, 0, 0},
 	{KEY_BACKSPACE, cursor_left_with_wrap, 0, 0},
@@ -8564,7 +9440,7 @@ struct action_map REPLACE_MAP[] = {
 	{-1, NULL, 0, 0},
 };
 
-struct action_map LINE_SELECTION_MAP[] = {
+struct action_map _LINE_SELECTION_MAP[] = {
 	{KEY_ESCAPE,    leave_selection, 0, 0},
 	{KEY_CTRL_C,    leave_selection, 0, 0},
 	{'V',           leave_selection, 0, 0},
@@ -8584,7 +9460,7 @@ struct action_map LINE_SELECTION_MAP[] = {
 	{-1, NULL, 0, 0},
 };
 
-struct action_map CHAR_SELECTION_MAP[] = {
+struct action_map _CHAR_SELECTION_MAP[] = {
 	{KEY_ESCAPE,    leave_selection, 0, 0},
 	{KEY_CTRL_C,    leave_selection, 0, 0},
 	{'v',           leave_selection, 0, 0},
@@ -8600,7 +9476,7 @@ struct action_map CHAR_SELECTION_MAP[] = {
 	{-1, NULL, 0, 0},
 };
 
-struct action_map COL_SELECTION_MAP[] = {
+struct action_map _COL_SELECTION_MAP[] = {
 	{KEY_ESCAPE,    leave_selection, 0, 0},
 	{KEY_CTRL_C,    leave_selection, 0, 0},
 	{KEY_CTRL_V,    leave_selection, 0, 0},
@@ -8610,7 +9486,7 @@ struct action_map COL_SELECTION_MAP[] = {
 	{-1, NULL, 0, 0},
 };
 
-struct action_map COL_INSERT_MAP[] = {
+struct action_map _COL_INSERT_MAP[] = {
 	{KEY_ESCAPE,    leave_selection, 0, 0},
 	{KEY_CTRL_C,    leave_selection, 0, 0},
 	{KEY_BACKSPACE, delete_at_column, opt_arg, -1},
@@ -8621,7 +9497,7 @@ struct action_map COL_INSERT_MAP[] = {
 	{-1, NULL, 0, 0},
 };
 
-struct action_map NAVIGATION_MAP[] = {
+struct action_map _NAVIGATION_MAP[] = {
 	/* Common navigation */
 	{KEY_CTRL_B,    go_page_up, opt_rep, 0},
 	{KEY_CTRL_F,    go_page_down, opt_rep, 0},
@@ -8662,10 +9538,13 @@ struct action_map NAVIGATION_MAP[] = {
 	{-1, NULL, 0, 0},
 };
 
-struct action_map ESCAPE_MAP[] = {
+struct action_map _ESCAPE_MAP[] = {
 	{KEY_F1,        toggle_numbers, 0, 0},
 	{KEY_F2,        toggle_indent, 0, 0},
+	{KEY_F3,        toggle_gutter, 0, 0},
+	{KEY_F4,        toggle_smartcomplete, 0, 0},
 	{KEY_MOUSE,     handle_mouse, 0, 0},
+	{KEY_MOUSE_SGR, handle_mouse_sgr, 0, 0},
 
 	{KEY_UP,        cursor_up, opt_rep, 0},
 	{KEY_DOWN,      cursor_down, opt_rep, 0},
@@ -8692,7 +9571,7 @@ struct action_map ESCAPE_MAP[] = {
 	{-1, NULL, 0, 0}
 };
 
-struct action_map COMMAND_MAP[] = {
+struct action_map _COMMAND_MAP[] = {
 	{KEY_ENTER,     command_accept, 0, 0},
 	{'\t',          command_tab_complete_buffer, 0, 0},
 	{KEY_UP,        command_scroll_history, opt_arg, -1}, /* back */
@@ -8701,7 +9580,7 @@ struct action_map COMMAND_MAP[] = {
 	{-1, NULL, 0, 0}
 };
 
-struct action_map SEARCH_MAP[] = {
+struct action_map _SEARCH_MAP[] = {
 	{KEY_ENTER,    search_accept, 0, 0},
 
 	{KEY_UP,       NULL, 0, 0},
@@ -8710,7 +9589,7 @@ struct action_map SEARCH_MAP[] = {
 	{-1, NULL, 0, 0}
 };
 
-struct action_map INPUT_BUFFER_MAP[] = {
+struct action_map _INPUT_BUFFER_MAP[] = {
 	/* These are generic and shared with search */
 	{KEY_ESCAPE,    command_discard, 0, 0},
 	{KEY_CTRL_C,    command_discard, 0, 0},
@@ -8727,9 +9606,40 @@ struct action_map INPUT_BUFFER_MAP[] = {
 	{-1, NULL, 0, 0}
 };
 
+/* DIRECTORY_BROWSE_MAP is only to override KEY_ENTER and should not be remapped,
+ * so unlike the others it is not going to be redefined as a pointer. */
 struct action_map DIRECTORY_BROWSE_MAP[] = {
 	{KEY_ENTER,     open_file_from_line, 0, 0},
 	{-1, NULL, 0, 0}
+};
+
+struct action_map * NORMAL_MAP = NULL;
+struct action_map * INSERT_MAP = NULL;
+struct action_map * REPLACE_MAP = NULL;
+struct action_map * LINE_SELECTION_MAP = NULL;
+struct action_map * CHAR_SELECTION_MAP = NULL;
+struct action_map * COL_SELECTION_MAP = NULL;
+struct action_map * COL_INSERT_MAP = NULL;
+struct action_map * NAVIGATION_MAP = NULL;
+struct action_map * ESCAPE_MAP = NULL;
+struct action_map * COMMAND_MAP = NULL;
+struct action_map * SEARCH_MAP = NULL;
+struct action_map * INPUT_BUFFER_MAP = NULL;
+
+struct mode_names mode_names[] = {
+	{"Normal","norm",&NORMAL_MAP},
+	{"Insert","insert",&INSERT_MAP},
+	{"Replace","replace",&REPLACE_MAP},
+	{"Line Selection","line",&LINE_SELECTION_MAP},
+	{"Char Selection","char",&CHAR_SELECTION_MAP},
+	{"Col Selection","col",&COL_SELECTION_MAP},
+	{"Col Insert","colinsert",&COL_INSERT_MAP},
+	{"Navigation (Select)","nav",&NAVIGATION_MAP},
+	{"Escape (Select, Insert)","esc",&ESCAPE_MAP},
+	{"Command","command",&COMMAND_MAP},
+	{"Search","search",&SEARCH_MAP},
+	{"Input (Command, Search)","input",&INPUT_BUFFER_MAP},
+	{NULL,NULL,NULL},
 };
 
 int handle_action(struct action_map * basemap, int key) {
@@ -8848,13 +9758,13 @@ void normal_mode(void) {
 						int line = -1, col = -1;
 						if (global_config.search_direction == 1) {
 							find_match(global_config.prev_line, global_config.prev_col, &line, &col, buffer, NULL);
-							if (line == -1) {
-								find_match(1, global_config.prev_col, &line, &col, buffer, NULL);
+							if (line == -1 && global_config.search_wraps) {
+								find_match(1, 1, &line, &col, buffer, NULL);
 							}
 						} else {
 							find_match_backwards(global_config.prev_line, global_config.prev_col, &line, &col, buffer);
-							if (line == -1) {
-								find_match_backwards(env->line_count, global_config.prev_col, &line, &col, buffer);
+							if (line == -1 && global_config.search_wraps) {
+								find_match_backwards(env->line_count, env->lines[env->line_count-1]->actual, &line, &col, buffer);
 							}
 						}
 
@@ -8909,6 +9819,10 @@ void normal_mode(void) {
 				/* Do nothing */
 			} else if (key < KEY_ESCAPE) {
 				insert_char(key);
+				if (global_config.smart_complete) {
+					redraw_line(env->line_no-1);
+					while (omni_complete(1) == 1);
+				}
 				refresh |= 1;
 			}
 		} else if (env->mode == MODE_REPLACE) {
@@ -9083,9 +9997,283 @@ static void show_usage(char * argv[]) {
 			" --help          " _s "show this help text" _e
 			" --version       " _s "show version information and available plugins" _e
 			" --dump-mappings " _s "dump markdown description of key mappings" _e
+			" --dump-commands " _s "dump markdown description of all commands" _e
+			" --dump-config   " _s "dump key mappings as a bimscript" _e
+			" --html FILE     " _s "convert FILE to syntax-highlighted HTML" _e
 			"\n", argv[0], argv[0]);
 #undef _e
 #undef _s
+}
+
+void free_function(struct bim_function * func) {
+	do {
+		struct bim_function * next = func->next;
+		free(func->command);
+		free(func);
+		func = next;
+	} while (func);
+}
+
+int run_function(char * name) {
+	for (int i = 0; i < flex_user_functions_count; ++i) {
+		if (user_functions[i] && !strcmp(user_functions[i]->command, name)) {
+			/* Execute function */
+			struct bim_function * this = user_functions[i]->next;
+			while (this) {
+				char * tmp = strdup(this->command);
+				int result = process_command(tmp);
+				free(tmp);
+				if (result != 0) {
+					return result;
+				}
+				this = this->next;
+			}
+			return 0;
+		}
+	}
+	return -1;
+}
+
+int has_function(char * name) {
+	for (int i = 0; i < flex_user_functions_count; ++i) {
+		if (user_functions[i] && !strcmp(user_functions[i]->command, name)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+BIM_COMMAND(call,"call","Call a function") {
+	if (argc < 2) {
+		render_error("Expected function name");
+		return 1;
+	}
+	int result = run_function(argv[1]);
+	if (result == -1) {
+		render_error("Undefined function: %s", argv[1]);
+		return 1;
+	}
+	return result;
+}
+
+BIM_COMMAND(try_call,"trycall","Call a function but return quietly if it fails") {
+	if (argc < 2) return 0;
+	run_function(argv[1]);
+	return 0;
+}
+
+BIM_COMMAND(list_functions,"listfunctions","List functions") {
+	render_commandline_message("");
+	for (int i = 0; i < flex_user_functions_count; ++i) {
+		render_commandline_message("%s\n", user_functions[i]->command);
+	}
+	pause_for_key();
+	return 0;
+}
+
+BIM_COMMAND(show_function,"showfunction","Show the commands in a function") {
+	if (argc < 2) return 1;
+	struct bim_function * this = NULL;
+	for (int i = 0; i < flex_user_functions_count; ++i) {
+		if (user_functions[i] && !strcmp(user_functions[i]->command, argv[1])) {
+			this = user_functions[i];
+			break;
+		}
+	}
+	if (!this) {
+		render_error("Not a function: %s", argv[1]);
+		return 1;
+	}
+
+	/* We really should rewrite this so syntax highlighting takes a highlighter */
+	struct syntax_definition * old_syntax = env->syntax;
+	env->syntax = find_syntax_calculator("bimcmd");
+
+	int i = 0;
+
+	while (this) {
+		/* Turn command into line */
+		line_t * tmp = calloc(sizeof(line_t) + sizeof(char_t) * strlen(this->command),1);
+		tmp->available = strlen(this->command);
+
+		unsigned char * t = (unsigned char *)this->command;
+		uint32_t state = 0;
+		uint32_t c = 0;
+		int col = 1;
+		while (*t) {
+			if (!decode(&state, &c, *t)) {
+				char_t _c = {codepoint_width(c), 0, c};
+				tmp = line_insert(tmp, _c, col - 1, -1);
+				col++;
+			}
+			t++;
+		}
+
+		render_commandline_message("");
+		render_line(tmp, global_config.term_width - 1, 0, -1);
+		printf("\n");
+		this = this->next;
+		i++;
+		if (this && i == global_config.term_height - 3) {
+			printf("(function continues)");
+			while (bim_getkey(200) == KEY_TIMEOUT);
+		}
+	}
+
+	/* Restore previous syntax */
+	env->syntax = old_syntax;
+
+	pause_for_key();
+	return 0;
+}
+
+BIM_COMMAND(runscript,"runscript","Run a script file") {
+	if (argc < 2) {
+		render_error("Expected a script to run");
+		return 1;
+	}
+
+	/* Run commands */
+	FILE * f;
+	char * home;
+	if (argv[1][0] == '~' && (home = getenv("HOME"))) {
+		char * tmp = malloc(strlen(argv[1]) + strlen(home) + 4);
+		sprintf(tmp,"%s%s", home, argv[1]+1);
+		f = fopen(tmp,"r");
+		free(tmp);
+	} else {
+		f = fopen(argv[1],"r");
+	}
+	if (!f) {
+		render_error("Failed to open script");
+		return 1;
+	}
+
+	int retval = 0;
+	char linebuf[4096];
+	int line = 1;
+	int was_collecting_function = 0;
+	char * function_name = NULL;
+	struct bim_function * new_function = NULL;
+	struct bim_function * last_function = NULL;
+
+	while (!feof(f)) {
+		memset(linebuf, 0, 4096);
+		fgets(linebuf, 4095, f);
+		/* Remove linefeed */
+		char * s = strstr(linebuf, "\n");
+		if (s) *s = '\0';
+
+		/* See if this is a special syntax element */
+		if (!strncmp(linebuf, "function ", 9)) {
+			/* Confirm we have a function name */
+			if (was_collecting_function) {
+				free_function(new_function);
+				render_error("Syntax error on line %d: attempt nest function while already defining function '%s'", line, function_name);
+				retval = 1;
+				break;
+			}
+			if (!strlen(linebuf+9)) {
+				render_error("Syntax error on line %d: function needs a name", line);
+				retval = 1;
+				break;
+			}
+			function_name = strdup(linebuf+9);
+			was_collecting_function = 1;
+			new_function = malloc(sizeof(struct bim_function));
+			new_function->command = strdup(function_name);
+			new_function->next = NULL;
+			last_function = new_function;
+			/* Set up function */
+		} else if (!strcmp(linebuf,"end")) {
+			if (!was_collecting_function) {
+				render_error("Syntax error on line %d: unexpected 'end'", line);
+				retval = 1;
+				break;
+			}
+			was_collecting_function = 0;
+			/* See if a function with this name is already defined */
+			int this = -1;
+			for (int i = 0; i < flex_user_functions_count; ++i) {
+				if (user_functions[i] && !strcmp(user_functions[i]->command, function_name)) {
+					this = i;
+					break;
+				}
+			}
+			if (this > -1) {
+				free_function(user_functions[this]);
+				user_functions[this] = new_function;
+			} else {
+				add_user_function(new_function);
+				if (strstr(function_name,"theme:") == function_name) {
+					add_colorscheme((struct theme_def){strdup(function_name+6), load_colorscheme_script});
+				}
+			}
+			free(function_name);
+			new_function = NULL;
+			last_function = NULL;
+			function_name = NULL;
+		} else if (was_collecting_function) {
+			/* Collect function */
+			last_function->next = malloc(sizeof(struct bim_function));
+			last_function = last_function->next;
+			char * s = linebuf;
+			while (*s == ' ') s++;
+			last_function->command = strdup(s);
+			last_function->next = NULL;
+		} else {
+			int result = process_command(linebuf);
+			if (result != 0) {
+				retval = result;
+				break;
+			}
+		}
+
+		line++;
+	}
+
+	if (was_collecting_function) {
+		free_function(new_function);
+		render_error("Syntax error on line %d: unexpected end of file while defining function '%s'", line, function_name);
+		retval = 1;
+	}
+
+	if (function_name) free(function_name);
+	fclose(f);
+	return retval;
+}
+
+BIM_COMMAND(rundir,"rundir","Run scripts from a directory, in unspecified order") {
+	if (argc < 2) return 1;
+	char * file = argv[1];
+	DIR * dirp = NULL;
+	if (file[0] == '~') {
+		char * home = getenv("HOME");
+		if (home) {
+			char * _file = malloc(strlen(file) + strlen(home) + 4); /* Paranoia */
+			sprintf(_file, "%s%s", home, file+1);
+			dirp = opendir(_file);
+			free(_file);
+		}
+	} else {
+		dirp = opendir(file);
+	}
+	if (!dirp) {
+		render_error("Directory is not accessible: %s", argv[1]);
+		return 1;
+	}
+	struct dirent * ent = readdir(dirp);
+	while (ent) {
+		if (str_ends_with(ent->d_name,".bimscript")) {
+			char * tmp = malloc(strlen(file) + 1 + strlen(ent->d_name) + 1);
+			snprintf(tmp, strlen(file) + 1 + strlen(ent->d_name) + 1, "%s/%s", file, ent->d_name);
+			char * args[] = {"runscript",tmp,NULL};
+			bim_command_runscript("runscript", 2, args);
+			free(tmp);
+		}
+		ent = readdir(dirp);
+	}
+	return 0;
 }
 
 /**
@@ -9120,101 +10308,16 @@ void load_bimrc(void) {
 		tmp = strdup(path);
 	}
 
-	/* Try to open the file */
-	FILE * bimrc = fopen(tmp, "r");
-	free(tmp);
+	struct stat statbuf;
+	if (stat(tmp, &statbuf)) return;
 
-	if (!bimrc) {
-		/* No bimrc, or bad permissions */
-		return;
+	char * args[] = {"runscript", tmp, NULL};
+	if (bim_command_runscript("runscript", 2, args)) {
+		/* Wait */
+		render_error("Errors were encountered when loading bimrc. Press ENTER to continue.");
+		int c;
+		while ((c = bim_getch(), c != ENTER_KEY && c != LINE_FEED));
 	}
-
-	/* Parse through lines */
-	char line[1024];
-	while (!feof(bimrc)) {
-		char * l = fgets(line, 1023, bimrc);
-
-		/* Ignore bad lines */
-		if (!l) break;
-		if (!*l) continue;
-		if (*l == '\n') continue;
-
-		/* Ignore comment lines */
-		if (*l == '#') continue;
-
-		/* Remove linefeed at the end */
-		char *nl = strstr(l,"\n");
-		if (nl) *nl = '\0';
-
-		/* Extract value from keypair, if available
-		 * (I foresee options without values in the future) */
-		char *value= strstr(l,"=");
-		if (value) {
-			*value = '\0';
-			value++;
-		}
-
-		/* theme=... */
-		if (!strcmp(l,"theme") && value) {
-			/* Examine available themes for a match. */
-			for (struct theme_def * d = themes; themes && d->name; ++d) {
-				if (!strcmp(value, d->name)) {
-					d->load();
-					break;
-				}
-			}
-		}
-
-		/* enable history (experimental) */
-		if (!strcmp(l,"history")) {
-			global_config.history_enabled = (value ? atoi(value) : 1);
-		}
-
-		/* padding= */
-		if (!strcmp(l,"padding") && value) {
-			global_config.cursor_padding = atoi(value);
-		}
-
-		if (!strcmp(l,"hlparen") && value) {
-			global_config.highlight_parens = atoi(value);
-		}
-
-		/* Disable highlighting of current line */
-		if (!strcmp(l,"hlcurrent") && value) {
-			global_config.highlight_current_line = atoi(value);
-		}
-
-		/* Relative line numbers */
-		if (!strcmp(l,"relativenumber") && value) {
-			global_config.relative_lines = atoi(value);
-		}
-
-		if (!strcmp(l,"splitpercent") && value) {
-			global_config.split_percent = atoi(value);
-		}
-
-		if (!strcmp(l,"shiftscrolling")) {
-			global_config.shift_scrolling = (value ? atoi(value) : 1);
-		}
-
-		if (!strcmp(l,"scrollamount") && value) {
-			global_config.scroll_amount = atoi(value);
-		}
-
-		if (!strcmp(l,"git") && value) {
-			global_config.check_git = !!atoi(value);
-		}
-
-		if (!strcmp(l,"colorgutter") && value) {
-			global_config.color_gutter = !!atoi(value);
-		}
-
-		if (!strcmp(l,"numbers") && value) {
-			global_config.numbers = !!atoi(value);
-		}
-	}
-
-	fclose(bimrc);
 }
 
 /**
@@ -9252,6 +10355,26 @@ void detect_weird_terminals(void) {
 		global_config.can_24bit = 0; /* Also not strictly true */
 		global_config.can_256color = 0; /* Not strictly true */
 	}
+	if (term && strstr(term,"xterm-256color") == term) {
+		global_config.can_insert = 1;
+		global_config.can_bracketedpaste = 1;
+		char * term_emu = getenv("TERMINAL_EMULATOR");
+		if (term_emu && strstr(term_emu,"JetBrains")) {
+			global_config.can_bce = 0;
+		}
+	}
+	if (term && strstr(term,"toaru") == term) {
+		global_config.can_insert = 1;
+		global_config.can_bracketedpaste = 1;
+	}
+
+	if (!global_config.can_unicode) {
+		global_config.tab_indicator = strdup(">");
+		global_config.space_indicator = strdup("-");
+	} else {
+		global_config.tab_indicator = strdup("»");
+		global_config.space_indicator = strdup("·");
+	}
 
 }
 
@@ -9259,11 +10382,42 @@ void detect_weird_terminals(void) {
  * Run global initialization tasks
  */
 void initialize(void) {
+	/* Force empty locale */
 	setlocale(LC_ALL, "");
 
+	/* Set up default key mappings */
+#define CLONE_MAP(map) do { \
+	int len = 0, i = 0; \
+	for (struct action_map * m = _ ## map; m->key != -1; m++, len++); \
+	map = malloc(sizeof(struct action_map) * (len + 1)); \
+	for (struct action_map * m = _ ## map; m->key != -1; m++, i++) { \
+		memcpy(&map[i], m, sizeof(struct action_map)); \
+	} \
+	map[i].key = -1; \
+} while (0)
+
+	CLONE_MAP(NORMAL_MAP);
+	CLONE_MAP(INSERT_MAP);
+	CLONE_MAP(REPLACE_MAP);
+	CLONE_MAP(LINE_SELECTION_MAP);
+	CLONE_MAP(CHAR_SELECTION_MAP);
+	CLONE_MAP(COL_SELECTION_MAP);
+	CLONE_MAP(COL_INSERT_MAP);
+	CLONE_MAP(NAVIGATION_MAP);
+	CLONE_MAP(ESCAPE_MAP);
+	CLONE_MAP(COMMAND_MAP);
+	CLONE_MAP(SEARCH_MAP);
+	CLONE_MAP(INPUT_BUFFER_MAP);
+
+#undef CLONE_MAP
+
+	/* Detect terminal quirks */
 	detect_weird_terminals();
+
+	/* Load bimrc */
 	load_bimrc();
 
+	/* Initialize space for buffers */
 	buffers_avail = 4;
 	buffers = malloc(sizeof(buffer_t *) * buffers_avail);
 }
@@ -9276,10 +10430,12 @@ void init_terminal(void) {
 		global_config.tty_in = STDERR_FILENO;
 	}
 	set_alternate_screen();
+	set_bracketed_paste();
 	update_screen_size();
 	get_initial_termios();
 	set_unbuffered();
 	mouse_enable();
+	global_config.has_terminal = 1;
 
 	signal(SIGWINCH, SIGWINCH_handler);
 	signal(SIGCONT,  SIGCONT_handler);
@@ -9307,6 +10463,25 @@ void dump_mapping(const char * description, struct action_map * map) {
 			action ? action->name : "(unbound)",
 			action ? action->description : "(unbound)");
 		m++;
+	}
+	printf("\n");
+}
+
+void dump_commands(void) {
+	printf("## Regular Commands\n");
+	printf("\n");
+	printf("| **Command** | **Description** |\n");
+	printf("|-------------|-----------------|\n");
+	for (struct command_def * c = regular_commands; regular_commands && c->name; ++c) {
+		printf("| `:%s` | %s |\n", c->name, c->description);
+	}
+	printf("\n");
+	printf("## Prefix Commands\n");
+	printf("\n");
+	printf("| **Command** | **Description** |\n");
+	printf("|-------------|-----------------|\n");
+	for (struct command_def * c = prefix_commands; prefix_commands && c->name; ++c) {
+		printf("| `:%s...` | %s |\n", !strcmp(c->name, "`") ? "`(backtick)`" : c->name, c->description);
 	}
 	printf("\n");
 }
@@ -9385,6 +10560,294 @@ _invalid_key_name:
 	return 1;
 }
 
+BIM_COMMAND(setcolor, "setcolor", "Set colorscheme colors") {
+#define PRINT_COLOR do { \
+	render_commandline_message("%20s = ", c->name); \
+	set_colors(*c->value, *c->value); \
+	printf("   "); \
+	set_colors(COLOR_FG, COLOR_BG); \
+	printf(" %s\n", *c->value); \
+	} while (0)
+	if (argc < 2) {
+		/* Print colors */
+		struct ColorName * c = color_names;
+		while (c->name) {
+			PRINT_COLOR;
+			c++;
+		}
+		pause_for_key();
+	} else {
+		char * colorname = argv[1];
+		char * space = strstr(colorname, " ");
+		if (!space) {
+			struct ColorName * c = color_names;
+			while (c->name) {
+				if (!strcmp(c->name, colorname)) {
+					PRINT_COLOR;
+					return 0;
+				}
+				c++;
+			}
+			render_error(":setcolor <colorname> <colorvalue>");
+			return 1;
+		}
+		char * colorvalue = space + 1;
+		*space = '\0';
+		struct ColorName * c = color_names;
+		while (c->name) {
+			if (!strcmp(c->name, colorname)) {
+				*(c->value) = strdup(colorvalue);
+				return 0;
+			}
+			c++;
+		}
+		render_error("Unknown color: %s", colorname);
+		return 1;
+	}
+	return 0;
+#undef PRINT_COLOR
+}
+
+BIM_COMMAND(checkprop,"checkprop","Check a property value; returns the inverse of the property") {
+	if (argc < 2) {
+		return 1;
+	}
+	if (!strcmp(argv[1],"can_scroll")) return !global_config.can_scroll;
+	else if (!strcmp(argv[1],"can_hideshow")) return !global_config.can_hideshow;
+	else if (!strcmp(argv[1],"can_altscreen")) return !global_config.can_altscreen;
+	else if (!strcmp(argv[1],"can_mouse")) return !global_config.can_mouse;
+	else if (!strcmp(argv[1],"can_unicode")) return !global_config.can_unicode;
+	else if (!strcmp(argv[1],"can_bright")) return !global_config.can_bright;
+	else if (!strcmp(argv[1],"can_title")) return !global_config.can_title;
+	else if (!strcmp(argv[1],"can_bce")) return !global_config.can_bce;
+	else if (!strcmp(argv[1],"can_24bit")) return !global_config.can_24bit;
+	else if (!strcmp(argv[1],"can_256color")) return !global_config.can_256color;
+	else if (!strcmp(argv[1],"can_italic")) return !global_config.can_italic;
+	render_error("Unknown property '%s'", argv[1]);
+	return 1;
+}
+
+BIM_COMMAND(action,"action","Execute a bim action") {
+	if (argc < 2) {
+		render_error("Expected :action <action-name> [arg [arg [arg...]]]");
+		return 1;
+	}
+
+	/* Split argument on spaces */
+	char * action = argv[1];
+	char * arg1 = NULL, * arg2 = NULL, * arg3 = NULL;
+	arg1 = strstr(argv[1]," ");
+	if (arg1) {
+		*arg1 = '\0';
+		arg1++;
+		arg2 = strstr(arg1," ");
+		if (arg2) {
+			*arg2 = '\0';
+			arg2++;
+			arg3 = strstr(arg1," ");
+			if (arg3) {
+				*arg3 = '\0';
+				arg3++;
+			}
+		}
+	}
+
+	/* Find the action */
+	for (int i = 0; i < flex_mappable_actions_count; ++i) {
+		if (!strcmp(mappable_actions[i].name, action)) {
+			/* Count arguments */
+			int args = 0;
+			if (mappable_actions[i].options & ARG_IS_CUSTOM) args++;
+			if (mappable_actions[i].options & ARG_IS_INPUT) args++;
+			if (mappable_actions[i].options & ARG_IS_PROMPT) args++;
+
+			if (args == 0) {
+				mappable_actions[i].action();
+			} else if (args == 1) {
+				if (!arg1) { render_error("Expected one argument"); return 1; }
+				mappable_actions[i].action(atoi(arg1));
+			} else if (args == 2) {
+				if (!arg2) { render_error("Expected two arguments"); return 1; }
+				mappable_actions[i].action(atoi(arg1), atoi(arg2));
+			} else if (args == 3) {
+				if (!arg3) { render_error("Expected three arguments"); return 1; }
+				mappable_actions[i].action(atoi(arg1), atoi(arg2), atoi(arg3));
+			}
+			return 0;
+		}
+	}
+
+	render_error("Unknown action: %s", action);
+	return 1;
+}
+
+char * describe_options(int options) {
+	static char out[16];
+
+	memset(out,0,sizeof(out));
+	if (options & opt_rep)  strcat(out,"r"); /* Repeats */
+	if (options & opt_arg)  strcat(out,"a"); /* takes Argument */
+	if (options & opt_char) strcat(out,"c"); /* takes Character */
+	if (options & opt_nav)  strcat(out,"n"); /* consumes Nav buffer */
+	if (options & opt_rw)   strcat(out,"w"); /* read-Write */
+	if (options & opt_norm) strcat(out,"m"); /* changes Mode */
+	if (options & opt_byte) strcat(out,"b"); /* takes Byte */
+
+	return out;
+}
+
+void dump_map_commands(const char * name, struct action_map * map) {
+	struct action_map * m = map;
+	while (m->key != -1) {
+		struct action_def * action = find_action(m->method);
+		fprintf(stdout,"mapkey %s %s %s",
+			name,
+			name_from_key(m->key),
+			action ? action->name : "none");
+		if (m->options) {
+			printf(" %s", describe_options(m->options));
+			if (m->options & opt_arg) {
+				printf(" %d", m->arg);
+			}
+		}
+		printf("\n");
+		m++;
+	}
+}
+
+BIM_COMMAND(mapkey,"mapkey","Map a key to an action.") {
+	if (argc < 2) goto _argument_error;
+
+	char * mode = argv[1];
+
+	char * key = strstr(mode," ");
+	if (!key) goto _argument_error;
+	*key = '\0';
+	key++;
+
+	char * action = strstr(key," ");
+	if (!action) goto _argument_error;
+	*action = '\0';
+	action++;
+
+	/* Options are optional */
+	char * options = strstr(action, " ");
+	char * arg = NULL;
+	if (options) {
+		*options = '\0';
+		options++;
+
+		arg = strstr(options, " ");
+		if (arg) {
+			*arg = '\0';
+			arg++;
+		}
+	}
+
+	render_status_message("Going to map key %s in mode %s to action %s with options %s, %s",
+		key, mode, action, options, arg);
+
+	/* Convert mode to mode name */
+	struct action_map ** mode_map = NULL;
+	for (struct mode_names * m = mode_names; m->name; ++m) {
+		if (!strcmp(m->name, mode)) {
+			mode_map = m->mode;
+			break;
+		}
+	}
+
+	if (!mode_map) {
+		render_error("invalid mode: %s", mode);
+		return 1;
+	}
+
+	enum Key keycode = key_from_name(key);
+	if (keycode == -1) {
+		render_error("invalid key: %s", key);
+		return 1;
+	}
+
+	struct action_def * action_def = NULL;
+	for (int i = 0; i < flex_mappable_actions_count; ++i) {
+		if (!strcmp(mappable_actions[i].name, action)) {
+			action_def = &mappable_actions[i];
+			break;
+		}
+	}
+
+	if (!action_def) {
+		render_error("invalid action: %s", action);
+		return 1;
+	}
+
+	/* Sanity check required options */
+	if ((action_def->options & ARG_IS_CUSTOM) &&
+		(!options || (!strchr(options,'a') && !strchr(options,'n')))) goto _action_sanity;
+	if ((action_def->options & ARG_IS_PROMPT) &&
+		(!options || (!strchr(options,'c') && !strchr(options,'b')))) goto _action_sanity;
+	if ((action_def->options & ACTION_IS_RW)  &&
+		(!options || !strchr(options,'w'))) goto _action_sanity;
+
+	int option_map = 0;
+
+	if (options) {
+		for (char * o = options; *o; ++o) {
+			switch (*o) {
+				case 'r': option_map |= opt_rep; break;
+				case 'a': option_map |= opt_arg; break;
+				case 'c': option_map |= opt_char; break;
+				case 'n': option_map |= opt_nav; break;
+				case 'w': option_map |= opt_rw; break;
+				case 'm': option_map |= opt_norm; break;
+				case 'b': option_map |= opt_byte; break;
+				default:
+					render_error("Invalid option flag: %c", *o);
+					return 1;
+			}
+		}
+	}
+
+	if ((option_map & opt_arg) && !arg) {
+		render_error("flag 'a' requires an additional argument");
+		return 1;
+	}
+
+	int arg_value = (option_map & opt_arg) ? atoi(arg) : 0;
+
+	/* Make space */
+	struct action_map * candidate = NULL;
+	for (struct action_map * m = *mode_map; m->key != -1; ++m) {
+		if (m->key == keycode) {
+			candidate = m;
+			break;
+		}
+	}
+
+	if (!candidate) {
+		/* get size */
+		int len = 0;
+		for (struct action_map * m = *mode_map; m->key != -1; m++, len++);
+		*mode_map = realloc(*mode_map, sizeof(struct action_map) * (len + 2));
+		candidate = &(*mode_map)[len];
+		(*mode_map)[len+1].key = -1;
+	}
+
+	candidate->key = keycode;
+	candidate->method = action_def->action;
+	candidate->options = option_map;
+	candidate->arg = arg_value;
+
+	return 0;
+
+_action_sanity:
+	render_error("action %s requires missing flag", action);
+	return 1;
+
+_argument_error:
+	render_error("usage: mapkey MODE KEY ACTION [OPTIONS [ARG]]");
+	return 1;
+}
+
 int main(int argc, char * argv[]) {
 	int opt;
 	while ((opt = getopt(argc, argv, "?c:C:u:RS:O:-:")) != -1) {
@@ -9402,7 +10865,7 @@ int main(int argc, char * argv[]) {
 					if (opt == 'C') {
 						draw_line_number(i);
 					}
-					render_line(env->lines[i], 6 * (env->lines[i]->actual + 1), 0, i + 1);
+					render_line(env->lines[i], 6 * (env->lines[i]->actual + 1), 0, -1);
 					reset();
 					fprintf(stdout, "\n");
 				}
@@ -9432,6 +10895,7 @@ int main(int argc, char * argv[]) {
 				break;
 			case '-':
 				if (!strcmp(optarg,"version")) {
+					initialize(); /* Need to load bimrc to get themes */
 					fprintf(stderr, "bim %s%s - %s\n", BIM_VERSION, BIM_BUILD_DATE, BIM_COPYRIGHT);
 					fprintf(stderr, " Available syntax highlighters:");
 					for (struct syntax_definition * s = syntaxes; syntaxes && s->name; ++s) {
@@ -9448,18 +10912,33 @@ int main(int argc, char * argv[]) {
 					show_usage(argv);
 					return 0;
 				} else if (!strcmp(optarg,"dump-mappings")) {
-					dump_mapping("Normal", NORMAL_MAP);
-					dump_mapping("Insert", INSERT_MAP);
-					dump_mapping("Replace", REPLACE_MAP);
-					dump_mapping("Line Selection", LINE_SELECTION_MAP);
-					dump_mapping("Char Selection", CHAR_SELECTION_MAP);
-					dump_mapping("Col Selection", COL_SELECTION_MAP);
-					dump_mapping("Col Insert", COL_INSERT_MAP);
-					dump_mapping("Navigation (Select)", NAVIGATION_MAP);
-					dump_mapping("Escape (Select, Insert)", ESCAPE_MAP);
-					dump_mapping("Command", COMMAND_MAP);
-					dump_mapping("Search", SEARCH_MAP);
-					dump_mapping("Input (Command, Search)", INPUT_BUFFER_MAP);
+					initialize();
+					for (struct mode_names * m = mode_names; m->name; ++m) {
+						dump_mapping(m->description, *m->mode);
+					}
+					return 0;
+				} else if (!strcmp(optarg,"dump-commands")) {
+					initialize();
+					dump_commands();
+					return 0;
+				} else if (!strcmp(optarg,"html")) {
+					if (optind >= argc) {
+						show_usage(argv);
+						return 1;
+					}
+					initialize();
+					global_config.go_to_line = 0;
+					open_file(argv[optind]);
+					convert_to_html();
+					/* write to stdout */
+					output_file(env, stdout);
+					return 0;
+				} else if (!strcmp(optarg,"dump-config")) {
+					initialize();
+					/* Dump a config file representing the current key mappings */
+					for (struct mode_names * m = mode_names; m->name; ++m) {
+						dump_map_commands(m->name, *m->mode);
+					}
 					return 0;
 				} else if (strlen(optarg)) {
 					fprintf(stderr, "bim: unrecognized option `%s'\n", optarg);
@@ -9502,236 +10981,6 @@ int main(int argc, char * argv[]) {
 
 	return 0;
 }
-/* 16-color theme, default */
-BIM_THEME(ansi) {
-	COLOR_FG        = global_config.can_bright ? "@17" : "@7";
-	COLOR_BG        = global_config.can_bright ? "@9"  : "@0";
-	COLOR_ALT_FG    = global_config.can_bright ? "@10" : "@5";
-	COLOR_ALT_BG    = "@9";
-	COLOR_NUMBER_FG = "@3";
-	COLOR_NUMBER_BG = "@9";
-	COLOR_STATUS_FG = global_config.can_bright ? "@17" : "@7";
-	COLOR_STATUS_BG = "@4";
-	COLOR_TABBAR_BG = "@4";
-	COLOR_TAB_BG    = "@4";
-	COLOR_KEYWORD   = global_config.can_bright ? "@14" : "@4";
-	COLOR_STRING    = "@2";
-	COLOR_COMMENT   = global_config.can_bright ? "@10" : "@5";
-	COLOR_TYPE      = "@3";
-	COLOR_PRAGMA    = "@1";
-	COLOR_NUMERAL   = "@1";
-
-	COLOR_ERROR_FG  = global_config.can_bright ? "@17" : "@7";
-	COLOR_ERROR_BG  = "@1";
-	COLOR_SEARCH_FG = "@0";
-	COLOR_SEARCH_BG = global_config.can_bright ? "@13" : "@3";
-
-	COLOR_SELECTBG  = global_config.can_bright ? "@17" : "@7";
-	COLOR_SELECTFG  = "@0";
-
-	COLOR_RED       = "@1";
-	COLOR_GREEN     = "@2";
-
-	COLOR_BOLD      = COLOR_FG; /* @ doesn't support extra args; FIXME */
-	COLOR_LINK      = global_config.can_bright ? "@14" : "@4";
-	COLOR_ESCAPE    = global_config.can_bright ? "@12" : "@2";
-
-	current_theme = "ansi";
-}
-
-/* "City Lights" based on citylights.xyz */
-BIM_THEME(citylights) {
-	if (!global_config.can_24bit) return;
-	COLOR_FG        = "2;151;178;198";
-	COLOR_BG        = "2;29;37;44";
-	COLOR_ALT_FG    = "2;45;55;65";
-	COLOR_ALT_BG    = "2;33;42;50";
-	COLOR_NUMBER_FG = "2;71;89;103";
-	COLOR_NUMBER_BG = "2;37;47;56";
-	COLOR_STATUS_FG = "2;116;144;166";
-	COLOR_STATUS_BG = "2;53;67;78";
-	COLOR_TABBAR_BG = "2;37;47;56";
-	COLOR_TAB_BG    = "2;29;37;44";
-	COLOR_KEYWORD   = "2;94;196;255";
-	COLOR_STRING    = "2;83;154;252";
-	COLOR_COMMENT   = "2;107;133;153;3";
-	COLOR_TYPE      = "2;139;212;156";
-	COLOR_PRAGMA    = "2;0;139;148";
-	COLOR_NUMERAL   = "2;207;118;132";
-
-	COLOR_ERROR_FG  = "5;15";
-	COLOR_ERROR_BG  = "5;196";
-	COLOR_SEARCH_FG = "5;234";
-	COLOR_SEARCH_BG = "5;226";
-
-	COLOR_SELECTFG  = "2;29;37;44";
-	COLOR_SELECTBG  = "2;151;178;198";
-
-	COLOR_RED       = "2;222;53;53";
-	COLOR_GREEN     = "2;55;167;0";
-
-	COLOR_BOLD      = "2;151;178;198;1";
-	COLOR_LINK      = "2;94;196;255;4";
-	COLOR_ESCAPE    = "2;133;182;249";
-
-	current_theme = "citylights";
-}
-
-/* Solarized Dark, popular theme */
-BIM_THEME(solarized_dark) {
-	if (!global_config.can_24bit) return;
-	COLOR_FG        = "2;147;161;161";
-	COLOR_BG        = "2;0;43;54";
-	COLOR_ALT_FG    = "2;147;161;161";
-	COLOR_ALT_BG    = "2;7;54;66";
-	COLOR_NUMBER_FG = "2;131;148;149";
-	COLOR_NUMBER_BG = "2;7;54;66";
-	COLOR_STATUS_FG = "2;131;148;150";
-	COLOR_STATUS_BG = "2;7;54;66";
-	COLOR_TABBAR_BG = "2;7;54;66";
-	COLOR_TAB_BG    = "2;131;148;150";
-	COLOR_KEYWORD   = "2;133;153;0";
-	COLOR_STRING    = "2;42;161;152";
-	COLOR_COMMENT   = "2;101;123;131";
-	COLOR_TYPE      = "2;181;137;0";
-	COLOR_PRAGMA    = "2;203;75;22";
-	COLOR_NUMERAL   = "2;220;50;47";
-
-	COLOR_ERROR_FG  = "5;15";
-	COLOR_ERROR_BG  = "5;196";
-	COLOR_SEARCH_FG = "5;234";
-	COLOR_SEARCH_BG = "5;226";
-
-	COLOR_SELECTFG  = "2;0;43;54";
-	COLOR_SELECTBG  = "2;147;161;161";
-
-	COLOR_RED       = "2;222;53;53";
-	COLOR_GREEN     = "2;55;167;0";
-
-	COLOR_BOLD      = "2;147;161;161;1";
-	COLOR_LINK      = "2;42;161;152;4";
-	COLOR_ESCAPE    = "2;133;153;0";
-
-	current_theme = "solarized-dark";
-}
-
-BIM_THEME(sunsmoke256) {
-	if (!global_config.can_256color) return;
-	COLOR_FG        = "5;188";
-	COLOR_BG        = "5;234";
-	COLOR_ALT_FG    = "5;244";
-	COLOR_ALT_BG    = "5;236";
-	COLOR_NUMBER_FG = "5;101";
-	COLOR_NUMBER_BG = "5;232";
-	COLOR_STATUS_FG = "5;188";
-	COLOR_STATUS_BG = "5;59";
-	COLOR_TABBAR_BG = "5;59";
-	COLOR_TAB_BG    = "5;59";
-	COLOR_KEYWORD   = "5;74";
-	COLOR_STRING    = "5;71";
-	COLOR_COMMENT   = global_config.can_italic ? "5;102;3" : "5;102";
-	COLOR_TYPE      = "5;221";
-	COLOR_PRAGMA    = "5;160";
-	COLOR_NUMERAL   = "5;161";
-
-	COLOR_ERROR_FG  = "5;15";
-	COLOR_ERROR_BG  = "5;196";
-	COLOR_SEARCH_FG = "5;234";
-	COLOR_SEARCH_BG = "5;226";
-
-	COLOR_SELECTFG  = "5;17";
-	COLOR_SELECTBG  = "5;109";
-
-	COLOR_RED       = "@1";
-	COLOR_GREEN     = "@2";
-
-	COLOR_BOLD      = "5;188;1";
-	COLOR_LINK      = "5;74;4";
-	COLOR_ESCAPE    = "5;79";
-
-	current_theme = "sunsmoke256";
-}
-
-/* Custom theme */
-BIM_THEME(sunsmoke) {
-	if (!global_config.can_24bit) {
-		load_colorscheme_sunsmoke256();
-		return;
-	}
-	COLOR_FG        = "2;230;230;230";
-	COLOR_BG        = "2;31;31;31";
-	COLOR_ALT_FG    = "2;122;122;122";
-	COLOR_ALT_BG    = "2;46;43;46";
-	COLOR_NUMBER_FG = "2;150;139;57";
-	COLOR_NUMBER_BG = "2;0;0;0";
-	COLOR_STATUS_FG = "2;230;230;230";
-	COLOR_STATUS_BG = "2;71;64;58";
-	COLOR_TABBAR_BG = "2;71;64;58";
-	COLOR_TAB_BG    = "2;71;64;58";
-	COLOR_KEYWORD   = "2;51;162;230";
-	COLOR_STRING    = "2;72;176;72";
-	COLOR_COMMENT   = "2;158;153;129;3";
-	COLOR_TYPE      = "2;230;206;110";
-	COLOR_PRAGMA    = "2;194;70;54";
-	COLOR_NUMERAL   = "2;230;43;127";
-
-	COLOR_ERROR_FG  = "5;15";
-	COLOR_ERROR_BG  = "5;196";
-	COLOR_SEARCH_FG = "5;234";
-	COLOR_SEARCH_BG = "5;226";
-
-	COLOR_SELECTFG  = "2;0;43;54";
-	COLOR_SELECTBG  = "2;147;161;161";
-
-	COLOR_RED       = "2;222;53;53";
-	COLOR_GREEN     = "2;55;167;0";
-
-	COLOR_BOLD      = "2;230;230;230;1";
-	COLOR_LINK      = "2;51;162;230;4";
-	COLOR_ESCAPE    = "2;113;203;173";
-
-	current_theme = "sunsmoke";
-}
-
-
-/* Based on the wombat256 theme for vim */
-BIM_THEME(wombat) {
-	if (!global_config.can_256color) return;
-	COLOR_FG        = "5;230";
-	COLOR_BG        = "5;235";
-	COLOR_ALT_FG    = "5;244";
-	COLOR_ALT_BG    = "5;236";
-	COLOR_NUMBER_BG = "5;232";
-	COLOR_NUMBER_FG = "5;101";
-	COLOR_STATUS_FG = "5;230";
-	COLOR_STATUS_BG = "5;238";
-	COLOR_TABBAR_BG = "5;230";
-	COLOR_TAB_BG    = "5;248";
-	COLOR_KEYWORD   = "5;117";
-	COLOR_STRING    = "5;113";
-	COLOR_COMMENT   = global_config.can_italic ? "5;102;3" : "5;102";
-	COLOR_TYPE      = "5;186";
-	COLOR_PRAGMA    = "5;173";
-	COLOR_NUMERAL   = COLOR_PRAGMA;
-
-	COLOR_ERROR_FG  = "5;15";
-	COLOR_ERROR_BG  = "5;196";
-	COLOR_SEARCH_FG = "5;234";
-	COLOR_SEARCH_BG = "5;226";
-
-	COLOR_SELECTFG  = "5;235";
-	COLOR_SELECTBG  = "5;230";
-
-	COLOR_RED       = "@1";
-	COLOR_GREEN     = "@2";
-
-	COLOR_BOLD      = "5;230;1";
-	COLOR_LINK      = "5;117;4";
-	COLOR_ESCAPE    = "5;194";
-
-	current_theme = "wombat";
-}
-
 char * syn_bash_keywords[] = {
 	/* Actual bash keywords */
 	"if","then","else","elif","fi","case","esac","for","coproc",
@@ -9917,7 +11166,15 @@ char * syn_bash_ext[] = {
 	NULL
 };
 
-BIM_SYNTAX(bash, 0)
+BIM_SYNTAX_COMPLETER(bash) {
+	for (char ** keyword = syn_bash_keywords; *keyword; ++keyword) {
+		add_if_match((*keyword),"(sh keyword)");
+	}
+
+	return 0;
+}
+
+BIM_SYNTAX_EXT(bash, 0, c_keyword_qualifier)
 int cmd_qualifier(int c) { return c != -1 && c != ' '; }
 
 extern int syn_bash_calculate(struct syntax_state * state);
@@ -9952,9 +11209,49 @@ static int bimcmd_find_commands(struct syntax_state * state) {
 	return 0;
 }
 
+static char * bimscript_comments[] = {
+	"@author","@version","@url","@description",
+	NULL
+};
+
+static int bcmd_at_keyword_qualifier(int c) {
+	return isalnum(c) || (c == '_') || (c == '@');
+}
+
 int syn_bimcmd_calculate(struct syntax_state * state) {
 	if (state->i == 0) {
-		if (match_and_paint(state, "theme", FLAG_KEYWORD, cmd_qualifier) ||
+		while (charat() == ' ') skip();
+		if (charat() == '#') {
+			while (charat() != -1) {
+				if (charat() == '@') {
+					if (!find_keywords(state, bimscript_comments, FLAG_ESCAPE, bcmd_at_keyword_qualifier)) {
+						paint(1, FLAG_COMMENT);
+					}
+				} else {
+					paint(1, FLAG_COMMENT);
+				}
+			}
+			return -1;
+		} else if (match_and_paint(state, "function", FLAG_PRAGMA, cmd_qualifier)) {
+			while (charat() == ' ') skip();
+			while (charat() != -1 && charat() != ' ') paint(1, FLAG_TYPE);
+			while (charat() != -1) paint(1, FLAG_ERROR);
+			return -1;
+		} else if (match_and_paint(state, "end", FLAG_PRAGMA, cmd_qualifier)) {
+			while (charat() != -1) paint(1, FLAG_ERROR);
+			return -1;
+		} else if (match_and_paint(state, "return", FLAG_PRAGMA, cmd_qualifier)) {
+			while (charat() == ' ') skip();
+			while (charat() != -1 && charat() != ' ') paint(1, FLAG_NUMERAL);
+			return -1;
+		} else if (match_and_paint(state, "call", FLAG_KEYWORD, cmd_qualifier) ||
+			match_and_paint(state, "trycall", FLAG_KEYWORD, cmd_qualifier) ||
+			match_and_paint(state, "showfunction", FLAG_KEYWORD, cmd_qualifier)) {
+			while (charat() == ' ') skip();
+			for (struct bim_function ** f = user_functions; user_functions && *f; ++f) {
+				if (match_and_paint(state, (*f)->command, FLAG_TYPE, cmd_qualifier)) break;
+			}
+		} else if (match_and_paint(state, "theme", FLAG_KEYWORD, cmd_qualifier) ||
 			match_and_paint(state, "colorscheme", FLAG_KEYWORD, cmd_qualifier)) {
 			while (charat() == ' ') skip();
 			for (struct theme_def * s = themes; themes && s->name; ++s) {
@@ -9966,6 +11263,42 @@ int syn_bimcmd_calculate(struct syntax_state * state) {
 				if (match_and_paint(state, s->name, FLAG_TYPE, cmd_qualifier)) return -1;
 			}
 			if (match_and_paint(state, "none", FLAG_TYPE, cmd_qualifier)) return -1;
+		} else if (match_and_paint(state, "setcolor", FLAG_KEYWORD, cmd_qualifier)) {
+			while (charat() == ' ') skip();
+			for (struct ColorName * c = color_names; c->name; ++c) {
+				if (match_and_paint(state, c->name, FLAG_TYPE, cmd_qualifier)) {
+					while (charat() != -1) paint(1, FLAG_STRING);
+					return -1;
+				}
+			}
+			return -1;
+		} else if (match_and_paint(state, "mapkey", FLAG_KEYWORD, cmd_qualifier)) {
+			if (charat() == ' ') skip(); else { paint(1, FLAG_ERROR); return -1; }
+			for (struct mode_names * m = mode_names; m->name; ++m) {
+				if (match_and_paint(state, m->name, FLAG_TYPE, cmd_qualifier)) break;
+			}
+			if (charat() == ' ') skip(); else { paint(1, FLAG_ERROR); return -1; }
+			while (charat() != ' ' && charat() != -1) skip(); /* key name */
+			if (charat() == ' ') skip(); else { paint(1, FLAG_ERROR); return -1; }
+			for (struct action_def * a = mappable_actions; a->name; ++a) {
+				if (match_and_paint(state, a->name, FLAG_TYPE, cmd_qualifier)) break;
+			}
+			match_and_paint(state, "none", FLAG_TYPE, cmd_qualifier);
+			if (charat() == -1) return -1;
+			if (charat() == ' ' && charat() != -1) skip(); else { paint(1, FLAG_ERROR); return -1; }
+			while (charat() != -1 && charat() != ' ') {
+				if (!strchr("racnwmb",charat())) {
+					paint(1, FLAG_ERROR);
+				} else {
+					skip();
+				}
+			}
+			return -1;
+		} else if (match_and_paint(state, "action", FLAG_KEYWORD, cmd_qualifier)) {
+			while (charat() == ' ') skip();
+			for (struct action_def * a = mappable_actions; a->name; ++a) {
+				if (match_and_paint(state, a->name, FLAG_TYPE, cmd_qualifier)) return -1;
+			}
 		} else if (charat() == '%' && nextchar() == 's') {
 			paint(1, FLAG_KEYWORD);
 			return bimcmd_paint_replacement(state);
@@ -9988,9 +11321,18 @@ int syn_bimcmd_calculate(struct syntax_state * state) {
 	return -1;
 }
 
-char * syn_bimcmd_ext[] = {NULL}; /* no files */
+char * syn_bimcmd_ext[] = {".bimscript",".bimrc",NULL}; /* no files */
 
-BIM_SYNTAX(bimcmd, 1)
+BIM_SYNTAX_COMPLETER(bimcmd) {
+	for (struct command_def * c = regular_commands; regular_commands && c->name; ++c) {
+		add_if_match(c->name,c->description);
+	}
+	add_if_match("function","Define a function");
+	add_if_match("end","End a function definition");
+	return 0;
+}
+
+BIM_SYNTAX_EXT(bimcmd, 1, cmd_qualifier)
 int syn_biminfo_calculate(struct syntax_state * state) {
 	if (state->i == 0) {
 		if (charat() == '#') {
@@ -10010,37 +11352,6 @@ int syn_biminfo_calculate(struct syntax_state * state) {
 char * syn_biminfo_ext[] = {".biminfo",NULL};
 
 BIM_SYNTAX(biminfo, 0)
-char * syn_bimrc_keywords[] = {
-	"history","padding","hlparen","hlcurrent","splitpercent","numbers",
-	"shiftscrolling","scrollamount","git","colorgutter","relativenumber",
-	NULL
-};
-
-int syn_bimrc_calculate(struct syntax_state * state) {
-	/* No states */
-	if (state->i == 0) {
-		if (charat() == '#') {
-			while (charat() != -1) {
-				if (common_comment_buzzwords(state)) continue;
-				else paint(1, FLAG_COMMENT);
-			}
-		} else if (match_and_paint(state, "theme", FLAG_KEYWORD, c_keyword_qualifier)) {
-			if (charat() == '=') {
-				skip();
-				for (struct theme_def * s = themes; themes && s->name; ++s) {
-					if (match_and_paint(state, s->name, FLAG_TYPE, c_keyword_qualifier)) break;
-				}
-			}
-		} else if (find_keywords(state, syn_bimrc_keywords, FLAG_KEYWORD, c_keyword_qualifier)) {
-			return -1;
-		}
-	}
-	return -1;
-}
-
-char * syn_bimrc_ext[] = {".bimrc",NULL};
-
-BIM_SYNTAX(bimrc, 0)
 /**
  * Syntax definition for C
  */
@@ -10111,6 +11422,7 @@ void paint_c_string(struct syntax_state * state) {
 					else while (isdigit(charat())) paint(1, FLAG_ESCAPE);
 				}
 				while (charat() == 'l' || charat() == 'z') paint(1, FLAG_ESCAPE);
+				if (charat() == '\\' || charat() == '"') continue;
 				paint(1, FLAG_ESCAPE);
 			}
 		} else if (charat() == '\\' && nextchar() == 'x') {
@@ -10255,6 +11567,11 @@ int syn_c_calculate(struct syntax_state * state) {
 					/* (for "includes", normal pragma highlighting covers that. */
 				} else if (match_and_paint(state, "if", FLAG_PRAGMA, c_keyword_qualifier)) {
 					/* These are to prevent #if and #else from being highlighted as keywords */
+					if (charat() == ' ' && nextchar() == '0' && charrel(2) == -1) {
+						state->i -= 4;
+						while (charat() != -1) paint(1, FLAG_COMMENT);
+						return 4;
+					}
 				} else if (match_and_paint(state, "else", FLAG_PRAGMA, c_keyword_qualifier)) {
 					/* ... */
 				}
@@ -10297,13 +11614,46 @@ int syn_c_calculate(struct syntax_state * state) {
 			/* In a block comment within an unclosed preprocessor statement */
 			if (paint_c_comment(state) == 1) return 3;
 			return paint_c_pragma(state);
+		default:
+			while (charat() == ' ' || charat() == '\t') paint(1, FLAG_COMMENT);
+			if (charat() == '#') {
+				paint(1, FLAG_COMMENT);
+				while (charat() == ' ' || charat() == '\t') paint(1, FLAG_COMMENT);
+				if (match_and_paint(state,"if",FLAG_COMMENT, c_keyword_qualifier)) {
+					while (charat() != -1) paint(1, FLAG_COMMENT);
+					return state->state + 1;
+				} else if (match_and_paint(state, "else", FLAG_COMMENT, c_keyword_qualifier) || match_and_paint(state, "elif", FLAG_COMMENT, c_keyword_qualifier)) {
+					while (charat() != -1) paint(1, FLAG_COMMENT);
+					return (state->state == 4) ? 0 : (state->state);
+				} else if (match_and_paint(state, "endif", FLAG_COMMENT, c_keyword_qualifier)) {
+					while (charat() != -1) paint(1, FLAG_COMMENT);
+					return (state->state == 4) ? 0 : (state->state - 1);
+				} else {
+					while (charat() != -1) paint(1, FLAG_COMMENT);
+					return (state->state);
+				}
+			} else {
+				while (charat() != -1) paint(1, FLAG_COMMENT);
+				return state->state;
+			}
+			break;
 	}
 	return -1;
 }
 
 char * syn_c_ext[] = {".c",".h",".cpp",".hpp",".c++",".h++",".cc",".hh",NULL};
 
-BIM_SYNTAX(c, 0)
+BIM_SYNTAX_COMPLETER(c) {
+	for (char ** keyword = syn_c_keywords; *keyword; ++keyword) {
+		add_if_match((*keyword),"(c keyword)");
+	}
+	for (char ** keyword = syn_c_types; *keyword; ++keyword) {
+		add_if_match((*keyword),"(c type)");
+	}
+	return 0;
+}
+
+BIM_SYNTAX_EXT(c, 0, c_keyword_qualifier)
 int syn_conf_calculate(struct syntax_state * state) {
 	if (state->i == 0) {
 		if (charat() == ';') {
@@ -10579,7 +11929,7 @@ int esh_variable_qualifier(int c) {
 int paint_esh_variable(struct syntax_state * state) {
 	if (charat() == '{') {
 		paint(1, FLAG_TYPE);
-		while (charat() != '}') paint(1, FLAG_TYPE);
+		while (charat() != '}' && charat() != -1) paint(1, FLAG_TYPE);
 		if (charat() == '}') paint(1, FLAG_TYPE);
 	} else {
 		if (charat() == '?' || charat() == '$' || charat() == '#') {
@@ -10806,7 +12156,7 @@ int syn_groovy_calculate(struct syntax_state * state) {
 	return -1;
 }
 
-char * syn_groovy_ext[] = {".groovy",".jenkinsfile",NULL};
+char * syn_groovy_ext[] = {".groovy",".jenkinsfile",".gradle",NULL};
 
 BIM_SYNTAX(groovy, 1)
 int syn_hosts_calculate(struct syntax_state * state) {
@@ -10825,7 +12175,7 @@ int syn_hosts_calculate(struct syntax_state * state) {
 	return -1;
 }
 
-char * syn_hosts_ext[] = {"hosts"};
+char * syn_hosts_ext[] = {"hosts",NULL};
 
 BIM_SYNTAX(hosts, 1)
 
@@ -10856,7 +12206,7 @@ static char * syn_java_at_comments[] = {
 	NULL
 };
 
-static int at_keyword_qualifier(int c) {
+static int java_at_keyword_qualifier(int c) {
 	return isalnum(c) || (c == '_') || (c == '@');
 }
 
@@ -10867,8 +12217,8 @@ static char * syn_java_brace_comments[] = {
 	NULL
 };
 
-static int brace_keyword_qualifier(int c) {
-	return isalnum(c) || (c == '{') || (c == '@');
+static int java_brace_keyword_qualifier(int c) {
+	return isalnum(c) || (c == '{') || (c == '@') || (c == '_');
 }
 
 static int paint_java_comment(struct syntax_state * state) {
@@ -10876,8 +12226,8 @@ static int paint_java_comment(struct syntax_state * state) {
 	while (charat() != -1) {
 		if (common_comment_buzzwords(state)) continue;
 		else if (charat() == '@') {
-			if (!find_keywords(state, syn_java_at_comments, FLAG_ESCAPE, at_keyword_qualifier)) {
-				if (match_and_paint(state, "@param", FLAG_ESCAPE, at_keyword_qualifier)) {
+			if (!find_keywords(state, syn_java_at_comments, FLAG_ESCAPE, java_at_keyword_qualifier)) {
+				if (match_and_paint(state, "@param", FLAG_ESCAPE, java_at_keyword_qualifier)) {
 					while (charat() == ' ') skip();
 					while (c_keyword_qualifier(charat())) paint(1, FLAG_TYPE);
 				} else {
@@ -10887,7 +12237,7 @@ static int paint_java_comment(struct syntax_state * state) {
 			}
 		} else if (charat() == '{') {
 			/* see if this terminates */
-			if (find_keywords(state, syn_java_brace_comments, FLAG_ESCAPE, brace_keyword_qualifier)) {
+			if (find_keywords(state, syn_java_brace_comments, FLAG_ESCAPE, java_brace_keyword_qualifier)) {
 				while (charat() != '}' && charat() != -1) {
 					paint(1, FLAG_ESCAPE);
 				}
@@ -10972,7 +12322,31 @@ int syn_java_calculate(struct syntax_state * state) {
 
 char * syn_java_ext[] = {".java",NULL};
 
-BIM_SYNTAX(java, 1)
+BIM_SYNTAX_COMPLETER(java) {
+	for (char ** keyword = syn_java_keywords; *keyword; ++keyword) {
+		add_if_match((*keyword),"(java keyword)");
+	}
+	for (char ** keyword = syn_java_types; *keyword; ++keyword) {
+		add_if_match((*keyword),"(java type)");
+	}
+
+	/* XXX Massive hack */
+	if (env->col_no > 1 && env->lines[env->line_no-1]->text[env->col_no-2].flags == FLAG_COMMENT) {
+		if (comp[0] == '@') {
+			for (char ** keyword = syn_java_at_comments; *keyword; ++keyword) {
+				add_if_match((*keyword),"(javadoc annotation)");
+			}
+		} else if (comp[0] == '{') {
+			for (char ** keyword = syn_java_brace_comments; *keyword; ++keyword) {
+				add_if_match((*keyword),"(javadoc annotation)");
+			}
+		}
+	}
+
+	return 0;
+}
+
+BIM_SYNTAX_EXT(java, 1, java_brace_keyword_qualifier)
 char * syn_json_keywords[] = {
 	"true","false","null",
 	NULL
@@ -11028,6 +12402,231 @@ int syn_json_calculate(struct syntax_state * state) {
 char * syn_json_ext[] = {".json",NULL}; // TODO other stuff that uses json
 
 BIM_SYNTAX(json, 1)
+static char * syn_kotlin_keywords[] = {
+	"as","as?","break","class","continue","do","else","false","for",
+	"fun","if","in","!in","interface","is","!is","null","object",
+	"package","return","super","this","throw","true","try","typealias",
+	"typeof","val","var","when","while",
+	"by","catch","constructor","delegate","dynamic","field","file",
+	"finally","get","import","init","param","property","receiver",
+	"set","setparam","where",
+	"actual","abstract","annotation","companion","const",
+	"crossinline","data","enum","expect","external","final",
+	"infix","inner","internal","lateinit","noinline","open",
+	"operator","out","override","private","protected","public",
+	"reified","sealed","suspend","tailrec","vararg",
+	"field","it","inline",
+	NULL
+};
+
+static char * syn_kotlin_types[] = {
+	"Byte","Short","Int","Long",
+	"Float","Double",
+	NULL
+};
+
+static char * syn_kotlin_at_comments[] = {
+	"@author","@see","@since","@return","@throws",
+	"@version","@exception","@deprecated",
+	/* @param is special */
+	NULL
+};
+
+static int kt_at_keyword_qualifier(int c) {
+	return isalnum(c) || (c == '_') || (c == '@');
+}
+
+static char * syn_kotlin_brace_comments[] = {
+	"{@docRoot","{@inheritDoc","{@link","{@linkplain",
+	"{@value","{@code","{@literal","{@serial",
+	"{@serialData","{@serialField",
+	NULL
+};
+
+static int kotlin_keyword_qualifier(int c) {
+	return isalnum(c) || (c == '?') || (c == '!') || (c == '_');
+}
+
+static int kt_brace_keyword_qualifier(int c) {
+	return isalnum(c) || (c == '{') || (c == '@') || (c == '_');
+}
+
+static int paint_kotlin_comment(struct syntax_state * state) {
+	int last = -1;
+	while (charat() != -1) {
+		if (common_comment_buzzwords(state)) continue;
+		else if (charat() == '@') {
+			if (!find_keywords(state, syn_kotlin_at_comments, FLAG_ESCAPE, kt_at_keyword_qualifier)) {
+				if (match_and_paint(state, "@param", FLAG_ESCAPE, kt_at_keyword_qualifier)) {
+					while (charat() == ' ') skip();
+					while (c_keyword_qualifier(charat())) paint(1, FLAG_TYPE);
+				} else {
+					/* Paint the @ */
+					paint(1, FLAG_COMMENT);
+				}
+			}
+		} else if (charat() == '{') {
+			/* see if this terminates */
+			if (find_keywords(state, syn_kotlin_brace_comments, FLAG_ESCAPE, kt_brace_keyword_qualifier)) {
+				while (charat() != '}' && charat() != -1) {
+					paint(1, FLAG_ESCAPE);
+				}
+				if (charat() == '}') paint(1, FLAG_ESCAPE);
+			} else {
+				paint(1, FLAG_COMMENT);
+			}
+		} else if (charat() == '<') {
+			int is_tag = 0;
+			for (int i = 1; charrel(i) != -1; ++i) {
+				if (charrel(i) == '>') {
+					is_tag = 1;
+					break;
+				}
+				if (!isalnum(charrel(i)) && charrel(i) != '/') {
+					is_tag = 0;
+					break;
+				}
+			}
+			if (is_tag) {
+				paint(1, FLAG_TYPE);
+				while (charat() != -1 && charat() != '>') {
+					if (charat() == '/') paint(1, FLAG_TYPE);
+					else paint(1, FLAG_KEYWORD);
+				}
+				if (charat() == '>') paint(1, FLAG_TYPE);
+			} else {
+				/* Paint the < */
+				paint(1, FLAG_COMMENT);
+			}
+		} else if (last == '*' && charat() == '/') {
+			paint(1, FLAG_COMMENT);
+			return 0;
+		} else {
+			last = charat();
+			paint(1, FLAG_COMMENT);
+		}
+	}
+	return 1;
+}
+
+int syn_kotlin_calculate(struct syntax_state * state) {
+	switch (state->state) {
+		case -1:
+		case 0:
+			if (!c_keyword_qualifier(lastchar()) && isdigit(charat())) {
+				paint_c_numeral(state);
+				return 0;
+			} else if (charat() == '/' && nextchar() == '/') {
+				/* C++-style comments */
+				paint_comment(state);
+			} else if (charat() == '/' && nextchar() == '*') {
+				/* C-style comments; TODO: Needs special stuff for @author; <html>; etc. */
+				if (paint_kotlin_comment(state) == 1) return 1;
+			} else if (find_keywords(state, syn_kotlin_keywords, FLAG_KEYWORD, kotlin_keyword_qualifier)) {
+				return 0;
+			} else if (find_keywords(state, syn_kotlin_types, FLAG_TYPE, c_keyword_qualifier)) {
+				return 0;
+			} else if (charat() == '\"') {
+				paint_simple_string(state);
+				return 0;
+			} else if (charat() == '\'') {
+				paint_c_char(state);
+				return 0;
+			} else if (charat() == '@') {
+				paint(1, FLAG_PRAGMA);
+				while (c_keyword_qualifier(charat())) paint(1, FLAG_PRAGMA);
+				return 0;
+			} else if (charat() != -1) {
+				skip();
+				return 0;
+			}
+			break;
+		case 1:
+			if (paint_kotlin_comment(state) == 1) return 1;
+			return 0;
+	}
+	return -1;
+}
+
+char * syn_kotlin_ext[] = {".kt",NULL};
+
+BIM_SYNTAX_COMPLETER(kotlin) {
+	for (char ** keyword = syn_kotlin_keywords; *keyword; ++keyword) {
+		add_if_match((*keyword),"(kotlin keyword)");
+	}
+	for (char ** keyword = syn_kotlin_types; *keyword; ++keyword) {
+		add_if_match((*keyword),"(kotlin type)");
+	}
+
+	/* XXX Massive hack */
+	if (env->col_no > 1 && env->lines[env->line_no-1]->text[env->col_no-2].flags == FLAG_COMMENT) {
+		if (comp[0] == '@') {
+			for (char ** keyword = syn_kotlin_at_comments; *keyword; ++keyword) {
+				add_if_match((*keyword),"(javadoc annotation)");
+			}
+		} else if (comp[0] == '{') {
+			for (char ** keyword = syn_kotlin_brace_comments; *keyword; ++keyword) {
+				add_if_match((*keyword),"(javadoc annotation)");
+			}
+		}
+	}
+
+	return 0;
+}
+
+BIM_SYNTAX_EXT(kotlin, 1, kt_brace_keyword_qualifier)
+
+int lisp_paren_flags[] = {
+	FLAG_DIFFPLUS, FLAG_TYPE, FLAG_PRAGMA, FLAG_KEYWORD,
+};
+
+int lisp_paren_flag_from_state(int i) {
+	return lisp_paren_flags[i % (sizeof(lisp_paren_flags) / sizeof(*lisp_paren_flags))];
+}
+
+int syn_lisp_calculate(struct syntax_state * state) {
+
+	if (state->state == -1) state->state = 0;
+
+	while (charat() != -1) {
+		if (charat() == ';') {
+			while (charat() != -1) paint(1, FLAG_COMMENT);
+		} else if (charat() == '(') {
+			paint(1, lisp_paren_flag_from_state(state->state));
+			state->state++;
+
+			while (charat() != ' ' && charat() != -1 && charat() != '(' && charat() != ')') {
+				paint(1, FLAG_KEYWORD);
+			}
+		} else if (charat() == ')') {
+			if (state->state == 0) {
+				paint(1, FLAG_ERROR);
+			} else {
+				state->state--;
+				paint(1, lisp_paren_flag_from_state(state->state));
+			}
+		} else if (charat() == ':') {
+			while (charat() != ' ' && charat() != -1 && charat() != '(' && charat() != ')') {
+				paint(1, FLAG_PRAGMA);
+			}
+		} else if (charat() == '"') {
+			paint_simple_string(state);
+		} else if (charat() != -1) {
+			skip();
+		}
+	}
+
+	if (state->state == 0) return -1;
+	if (charat() == -1) return state->state;
+	return -1; /* Not sure what happened */
+}
+
+char * syn_lisp_ext[] = {
+	".lisp",".lsp",".cl",
+	NULL
+};
+
+BIM_SYNTAX(lisp, 0)
 int make_command_qualifier(int c) {
 	return isalnum(c) || c == '_' || c == '-' || c == '.';
 }
@@ -11182,6 +12781,45 @@ int syn_make_calculate(struct syntax_state * state) {
 char * syn_make_ext[] = {"Makefile","makefile","GNUmakefile",".mak",NULL};
 
 BIM_SYNTAX(make, 0)
+/**
+ * NROFF highlighter
+ */
+
+int syn_man_calculate(struct syntax_state * state) {
+	while (charat() != -1) {
+		if (state->i == 0 && charat() == '.') {
+			if (nextchar() == 'S' && charrel(2) == 'H' && charrel(3) == ' ') {
+				paint(3, FLAG_KEYWORD);
+				while (charat() != -1) paint(1, FLAG_STRING);
+			} else if (nextchar() == 'B' && charrel(2) == ' ') {
+				paint(2, FLAG_KEYWORD);
+				while (charat() != -1) paint(1, FLAG_BOLD);
+			} else if (isalpha(nextchar())) {
+				paint(1, FLAG_KEYWORD);
+				while (charat() != -1 && isalpha(charat())) paint(1, FLAG_KEYWORD);
+			} else if (nextchar() == '\\' && charrel(2) == '"') {
+				while (charat() != -1) paint(1, FLAG_COMMENT);
+			} else {
+				skip();
+			}
+		} else if (charat() == '\\') {
+			if (nextchar() == 'f') {
+				paint(2, FLAG_NUMERAL);
+				paint(1, FLAG_PRAGMA);
+			} else {
+				paint(2, FLAG_ESCAPE);
+			}
+		} else {
+			skip();
+		}
+	}
+	return -1;
+}
+
+/* Yes this is dumb. No, I don't care. */
+char * syn_man_ext[] = {".1",".2",".3",".4",".5",".6",".7",".8",NULL};
+
+BIM_SYNTAX(man, 0)
 static struct syntax_definition * syn_c = NULL;
 static struct syntax_definition * syn_py = NULL;
 static struct syntax_definition * syn_java = NULL;
@@ -11190,6 +12828,7 @@ static struct syntax_definition * syn_xml = NULL;
 static struct syntax_definition * syn_make = NULL;
 static struct syntax_definition * syn_diff = NULL;
 static struct syntax_definition * syn_rust = NULL;
+static struct syntax_definition * syn_bash = NULL;
 
 static int _initialized = 0;
 
@@ -11204,6 +12843,7 @@ int syn_markdown_calculate(struct syntax_state * state) {
 		syn_make = find_syntax_calculator("make");
 		syn_diff = find_syntax_calculator("diff");
 		syn_rust = find_syntax_calculator("rust");
+		syn_bash = find_syntax_calculator("bash");
 	}
 	if (state->state < 1) {
 		while (charat() != -1) {
@@ -11233,8 +12873,10 @@ int syn_markdown_calculate(struct syntax_state * state) {
 						nest(syn_make->calculate, 600);
 					} else if (syn_diff && match_forward(state, "diff")) {
 						nest(syn_diff->calculate, 700);
+					} else if (syn_bash && match_forward(state, "bash")) {
+						nest(syn_bash->calculate, 800);
 					} else if (syn_rust && match_forward(state, "rust")) {
-						nest(syn_rust->calculate, 800); /* Keep this at the end for now */
+						nest(syn_rust->calculate, 900); /* Keep this at the end for now */
 					}
 					return 1;
 				}
@@ -11303,8 +12945,10 @@ _nope:
 			nest(syn_make->calculate, 600);
 		} else if (state->state < 799) {
 			nest(syn_diff->calculate, 700);
+		} else if (state->state < 899) {
+			nest(syn_bash->calculate, 800);
 		} else {
-			nest(syn_rust->calculate, 800);
+			nest(syn_rust->calculate, 900);
 		}
 	}
 	return -1;
@@ -11442,30 +13086,30 @@ int paint_py_single_string(struct syntax_state * state) {
 int paint_py_numeral(struct syntax_state * state) {
 	if (charat() == '0' && (nextchar() == 'x' || nextchar() == 'X')) {
 		paint(2, FLAG_NUMERAL);
-		while (isxdigit(charat())) paint(1, FLAG_NUMERAL);
+		while (isxdigit(charat()) || charat() == '_') paint(1, FLAG_NUMERAL);
 	} else if (charat() == '0' && nextchar() == '.') {
 		paint(2, FLAG_NUMERAL);
-		while (isdigit(charat())) paint(1, FLAG_NUMERAL);
+		while (isdigit(charat()) || charat() == '_') paint(1, FLAG_NUMERAL);
 		if ((charat() == '+' || charat() == '-') && (nextchar() == 'e' || nextchar() == 'E')) {
 			paint(2, FLAG_NUMERAL);
-			while (isdigit(charat())) paint(1, FLAG_NUMERAL);
+			while (isdigit(charat()) || charat() == '_') paint(1, FLAG_NUMERAL);
 		} else if (charat() == 'e' || charat() == 'E') {
 			paint(1, FLAG_NUMERAL);
-			while (isdigit(charat())) paint(1, FLAG_NUMERAL);
+			while (isdigit(charat()) || charat() == '_') paint(1, FLAG_NUMERAL);
 		}
 		if (charat() == 'j') paint(1, FLAG_NUMERAL);
 		return 0;
 	} else {
-		while (isdigit(charat())) paint(1, FLAG_NUMERAL);
+		while (isdigit(charat()) || charat() == '_') paint(1, FLAG_NUMERAL);
 		if (charat() == '.') {
 			paint(1, FLAG_NUMERAL);
-			while (isdigit(charat())) paint(1, FLAG_NUMERAL);
+			while (isdigit(charat()) || charat() == '_') paint(1, FLAG_NUMERAL);
 			if ((charat() == '+' || charat() == '-') && (nextchar() == 'e' || nextchar() == 'E')) {
 				paint(2, FLAG_NUMERAL);
-				while (isdigit(charat())) paint(1, FLAG_NUMERAL);
+				while (isdigit(charat()) || charat() == '_') paint(1, FLAG_NUMERAL);
 			} else if (charat() == 'e' || charat() == 'E') {
 				paint(1, FLAG_NUMERAL);
-				while (isdigit(charat())) paint(1, FLAG_NUMERAL);
+				while (isdigit(charat()) || charat() == '_') paint(1, FLAG_NUMERAL);
 			}
 			if (charat() == 'j') paint(1, FLAG_NUMERAL);
 			return 0;

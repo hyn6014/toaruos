@@ -14,6 +14,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
@@ -30,6 +31,8 @@
 #include <toaru/graphics.h>
 #include <toaru/termemu.h>
 #include <toaru/mouse.h>
+#include <toaru/list.h>
+#include <toaru/spinlock.h>
 
 #include "vga-palette.h"
 
@@ -163,6 +166,36 @@ void set_title(char * c) {
 
 static void cell_redraw(uint16_t x, uint16_t y);
 static void cell_redraw_inverted(uint16_t x, uint16_t y);
+
+int is_in_selection(int x, int y) {
+	if (selection_end_y < selection_start_y) {
+		if (y == selection_end_y) {
+			return (x >= selection_end_x);
+		} else if (y == selection_start_y) {
+			return (x <= selection_start_x);
+		} else {
+			return (y > selection_end_y && y < selection_start_y);
+		}
+	} else if (selection_end_y > selection_start_y) {
+		if (y == selection_start_y) {
+			return (x >= selection_start_x);
+		} else if (y == selection_end_y) {
+			return (x <= selection_end_x);
+		} else {
+			return (y > selection_start_y && y < selection_end_y);
+		}
+	} else if (selection_end_y == selection_start_y) {
+		if (y != selection_end_y) return 0;
+		if (selection_start_x > selection_end_x) {
+			return (x >= selection_end_x && x <= selection_start_x);
+		} else if (selection_start_x < selection_end_x) {
+			return (x >= selection_start_x && x <= selection_end_x);
+		} else {
+			return x == selection_start_x;
+		}
+	}
+	return 0;
+}
 
 void iterate_selection(void (*func)(uint16_t x, uint16_t y)) {
 	if (selection_end_y < selection_start_y) {
@@ -389,17 +422,74 @@ char * copy_selection(void) {
 	return selection_text;
 }
 
-void input_buffer_stuff(char * str) {
-	size_t s = strlen(str) + 1;
-	write(fd_master, str, s);
+static volatile int input_buffer_lock = 0;
+static int input_buffer_semaphore[2];
+static list_t * input_buffer_queue = NULL;
+struct input_data {
+	size_t len;
+	char data[];
+};
+
+void * handle_input_writing(void * unused) {
+	(void)unused;
+
+	while (1) {
+
+		/* Read one byte from semaphore; as long as semaphore has data,
+		 * there is another input blob to write to the TTY */
+		char tmp[1];
+		int c = read(input_buffer_semaphore[0],tmp,1);
+		if (c > 0) {
+			/* Retrieve blob */
+			spin_lock(&input_buffer_lock);
+			node_t * blob = list_dequeue(input_buffer_queue);
+			spin_unlock(&input_buffer_lock);
+			/* No blobs? This shouldn't happen, but just in case, just continue */
+			if (!blob) {
+				continue;
+			}
+			/* Write blob data to the tty */
+			struct input_data * value = blob->value;
+			write(fd_master, value->data, value->len);
+			free(blob->value);
+			free(blob);
+		} else {
+			/* The pipe has closed, terminal is exiting */
+			break;
+		}
+	}
+
+	return NULL;
+}
+
+static void write_input_buffer(char * data, size_t len) {
+	struct input_data * d = malloc(sizeof(struct input_data) + len);
+	d->len = len;
+	memcpy(&d->data, data, len);
+	spin_lock(&input_buffer_lock);
+	list_insert(input_buffer_queue, d);
+	spin_unlock(&input_buffer_lock);
+	write(input_buffer_semaphore[1], d, 1);
+}
+
+void handle_input(char c) {
+	write_input_buffer(&c, 1);
+}
+
+void handle_input_s(char * c) {
+	size_t len = strlen(c);
+	write_input_buffer(c, len);
 }
 
 unsigned short * textmemptr = (unsigned short *)0xB8000;
+unsigned short * mirrorcopy = NULL;
 void placech(unsigned char c, int x, int y, int attr) {
-	unsigned short *where;
-	unsigned att = attr << 8;
-	where = textmemptr + (y * 80 + x);
-	*where = c | att;
+	unsigned int where = y * term_width + x;
+	unsigned int att = (c | (attr << 8));
+	if (mirrorcopy[where] != att) {
+		mirrorcopy[where] = att;
+		textmemptr[where] = att;
+	}
 }
 
 /* ANSI-to-VGA */
@@ -408,173 +498,7 @@ char vga_to_ansi[] = {
 	8,12,10,14, 9,13,11,15
 };
 
-uint32_t ununicode(uint32_t c) {
-	switch (c) {
-		case L'☺': return 1;
-		case L'☻': return 2;
-		case L'♥': return 3;
-		case L'♦': return 4;
-		case L'♣': return 5;
-		case L'♠': return 6;
-		case L'•': return 7;
-		case L'◘': return 8;
-		case L'○': return 9;
-		case L'◙': return 10;
-		case L'♂': return 11;
-		case L'♀': return 12;
-		case L'♪': return 13;
-		case L'♫': return 14;
-		case L'☼': return 15;
-		case L'►': return 16;
-		case L'◄': return 17;
-		case L'↕': return 18;
-		case L'‼': return 19;
-		case L'¶': return 20;
-		case L'§': return 21;
-		case L'▬': return 22;
-		case L'↨': return 23;
-		case L'↑': return 24;
-		case L'↓': return 25;
-		case L'→': return 26;
-		case L'←': return 27;
-		case L'∟': return 28;
-		case L'↔': return 29;
-		case L'▲': return 30;
-		case L'▼': return 31;
-		/* ASCII text */
-		case L'⌂': return 127;
-		case L'Ç': return 128;
-		case L'ü': return 129;
-		case L'é': return 130;
-		case L'â': return 131;
-		case L'ä': return 132;
-		case L'à': return 133;
-		case L'å': return 134;
-		case L'ç': return 135;
-		case L'ê': return 136;
-		case L'ë': return 137;
-		case L'è': return 138;
-		case L'ï': return 139;
-		case L'î': return 140;
-		case L'ì': return 141;
-		case L'Ä': return 142;
-		case L'Å': return 143;
-		case L'É': return 144;
-		case L'æ': return 145;
-		case L'Æ': return 146;
-		case L'ô': return 147;
-		case L'ö': return 148;
-		case L'ò': return 149;
-		case L'û': return 150;
-		case L'ù': return 151;
-		case L'ÿ': return 152;
-		case L'Ö': return 153;
-		case L'Ü': return 154;
-		case L'¢': return 155;
-		case L'£': return 156;
-		case L'¥': return 157;
-		case L'₧': return 158;
-		case L'ƒ': return 159;
-		case L'á': return 160;
-		case L'í': return 161;
-		case L'ó': return 162;
-		case L'ú': return 163;
-		case L'ñ': return 164;
-		case L'Ñ': return 165;
-		case L'ª': return 166;
-		case L'º': return 167;
-		case L'¿': return 168;
-		case L'⌐': return 169;
-		case L'¬': return 170;
-		case L'½': return 171;
-		case L'¼': return 172;
-		case L'¡': return 173;
-		case L'«': return 174;
-		case L'»': return 175;
-		case L'░': return 176;
-		case L'▒': return 177;
-		case L'▓': return 178;
-		case L'│': return 179;
-		case L'┤': return 180;
-		case L'╡': return 181;
-		case L'╢': return 182;
-		case L'╖': return 183;
-		case L'╕': return 184;
-		case L'╣': return 185;
-		case L'║': return 186;
-		case L'╗': return 187;
-		case L'╝': return 188;
-		case L'╜': return 189;
-		case L'╛': return 190;
-		case L'┐': return 191;
-		case L'└': return 192;
-		case L'┴': return 193;
-		case L'┬': return 194;
-		case L'├': return 195;
-		case L'─': return 196;
-		case L'┼': return 197;
-		case L'╞': return 198;
-		case L'╟': return 199;
-		case L'╚': return 200;
-		case L'╔': return 201;
-		case L'╩': return 202;
-		case L'╦': return 203;
-		case L'╠': return 204;
-		case L'═': return 205;
-		case L'╬': return 206;
-		case L'╧': return 207;
-		case L'╨': return 208;
-		case L'╤': return 209;
-		case L'╥': return 210;
-		case L'╙': return 211;
-		case L'╘': return 212;
-		case L'╒': return 213;
-		case L'╓': return 214;
-		case L'╫': return 215;
-		case L'╪': return 216;
-		case L'┘': return 217;
-		case L'┌': return 218;
-		case L'█': return 219;
-		case L'▄': return 220;
-		case L'▌': return 221;
-		case L'▐': return 222;
-		case L'▀': return 223;
-		case L'α': return 224;
-		case L'ß': return 225;
-		case L'Γ': return 226;
-		case L'π': return 227;
-		case L'Σ': return 228;
-		case L'σ': return 229;
-		case L'µ': return 230;
-		case L'τ': return 231;
-		case L'Φ': return 232;
-		case L'Θ': return 233;
-		case L'Ω': return 234;
-		case L'δ': return 235;
-		case L'∞': return 236;
-		case L'φ': return 237;
-		case L'ε': return 238;
-		case L'∩': return 239;
-		case L'≡': return 240;
-		case L'±': return 241;
-		case L'≥': return 242;
-		case L'≤': return 243;
-		case L'⌠': return 244;
-		case L'⌡': return 245;
-		case L'÷': return 246;
-		case L'≈': return 247;
-		case L'°': return 248;
-		case L'∙': return 249;
-		case L'·': return 250;
-		case L'√': return 251;
-		case L'ⁿ': return 252;
-		case L'²': return 253;
-		case L'■': return 254;
-		/* Special cases */
-		case L'▏': return 179; /* Replace with vertical bar to support bim better */
-	}
-	return 4;
-}
+#include "ununicode.h"
 
 void
 term_write_char(
@@ -585,7 +509,8 @@ term_write_char(
 		uint32_t bg,
 		uint8_t flags
 		) {
-	if (val > 128) val = ununicode(val);
+	if (val == L'▏') val = 179;
+	else if (val > 128) val = ununicode(val);
 	if (fg > 256) {
 		fg = best_match(fg);
 	}
@@ -657,7 +582,8 @@ void draw_cursor() {
 	render_cursor();
 }
 
-void term_redraw_all() { 
+void term_redraw_all() {
+	/* Redraw to a temp buffer */
 	for (uint16_t y = 0; y < term_height; ++y) {
 		for (uint16_t x = 0; x < term_width; ++x) {
 			cell_redraw(x,y);
@@ -665,32 +591,56 @@ void term_redraw_all() {
 	}
 }
 
-void term_scroll(int how_much) {
-	if (how_much >= term_height || -how_much >= term_height) {
-		term_clear();
-		return;
+void term_shift_region(int top, int height, int how_much) {
+	if (how_much == 0) return;
+
+	int destination, source;
+	int count, new_top, new_bottom;
+	if (how_much > height) {
+		count = 0;
+		new_top = top;
+		new_bottom = top + height;
+	} else if (how_much > 0) {
+		destination = term_width * top;
+		source = term_width * (top + how_much);
+		count = height - how_much;
+		new_top = top + height - how_much;
+		new_bottom = top + height;
+	} else if (how_much < 0) {
+		destination = term_width * (top - how_much);
+		source = term_width * top;
+		count = height + how_much;
+		new_top = top;
+		new_bottom = top - how_much;
 	}
-	if (how_much == 0) {
-		return;
+
+	/* Move from top+how_much to top */
+	if (count) {
+		memmove(term_buffer + destination, term_buffer + source, count * term_width * sizeof(term_cell_t));
 	}
-	if (how_much > 0) {
-		/* Shift terminal cells one row up */
-		memmove(term_buffer, (void *)((uintptr_t)term_buffer + sizeof(term_cell_t) * term_width * how_much), sizeof(term_cell_t) * term_width * (term_height - how_much));
-		/* Reset the "new" row to clean cells */
-		memset((void *)((uintptr_t)term_buffer + sizeof(term_cell_t) * term_width * (term_height - how_much)), 0x0, sizeof(term_cell_t) * term_width * how_much);
-		for (int i = 0; i < how_much; ++i) {
-			for (uint16_t x = 0; x < term_width; ++x) {
-				cell_set(x,term_height - how_much,' ', current_fg, current_bg, ansi_state->flags);
-			}
+
+	/* Clear new lines at bottom */
+	for (int i = new_top; i < new_bottom; ++i) {
+		for (uint16_t x = 0; x < term_width; ++x) {
+			cell_set(x, i, ' ', current_fg, current_bg, ansi_state->flags);
 		}
-		term_redraw_all();
+	}
+
+	term_redraw_all();
+}
+
+void term_scroll(int how_much) {
+	term_shift_region(0,term_height,how_much);
+}
+
+void insert_delete_lines(int how_many) {
+	if (how_many == 0) return;
+
+	if (how_many > 0) {
+		/* Insert lines is equivalent to scrolling from the current line */
+		term_shift_region(csr_y,term_height-csr_y,-how_many);
 	} else {
-		how_much = -how_much;
-		/* Shift terminal cells one row up */
-		memmove((void *)((uintptr_t)term_buffer + sizeof(term_cell_t) * term_width * how_much), term_buffer, sizeof(term_cell_t) * term_width * (term_height - how_much));
-		/* Reset the "new" row to clean cells */
-		memset(term_buffer, 0x0, sizeof(term_cell_t) * term_width * how_much);
-		term_redraw_all();
+		term_shift_region(csr_y,term_height-csr_y,-how_many);
 	}
 }
 
@@ -843,24 +793,7 @@ void term_clear(int i) {
 	}
 }
 
-#define INPUT_SIZE 1024
-char input_buffer[INPUT_SIZE];
-int  input_collected = 0;
-
-void clear_input() {
-	memset(input_buffer, 0x0, INPUT_SIZE);
-	input_collected = 0;
-}
-
 pid_t child_pid = 0;
-
-void handle_input(char c) {
-	write(fd_master, &c, 1);
-}
-
-void handle_input_s(char * c) {
-	write(fd_master, c, strlen(c));
-}
 
 void key_event(int ret, key_event_t * event) {
 	if (ret) {
@@ -879,7 +812,13 @@ void key_event(int ret, key_event_t * event) {
 			(event->keycode == 'v')) {
 			/* Paste selection */
 			if (selection_text) {
-				handle_input_s(selection_text);
+				if (ansi_state->paste_mode) {
+					handle_input_s("\033[200~");
+					handle_input_s(selection_text);
+					handle_input_s("\033[201~");
+				} else {
+					handle_input_s(selection_text);
+				}
 			}
 			return;
 		}
@@ -1065,13 +1004,14 @@ term_callbacks_t term_callbacks = {
 	term_clear,
 	term_scroll,
 	term_redraw_cursor,
-	input_buffer_stuff,
+	handle_input_s,
 	set_title,
 	unsupported,
 	unsupported_int,
 	unsupported_int,
 	term_set_csr_show,
 	term_switch_buffer,
+	insert_delete_lines,
 };
 
 void reinit(void) {
@@ -1085,6 +1025,8 @@ void reinit(void) {
 		memset(term_buffer_b, 0x0, sizeof(term_cell_t) * term_width * term_height);
 
 		term_buffer = term_buffer_a;
+		mirrorcopy = malloc(sizeof(unsigned short) * term_width * term_height);
+		memset(mirrorcopy, 0, sizeof(unsigned short) * term_width * term_height);
 	}
 
 	ansi_state = ansi_init(ansi_state, term_width, term_height, &term_callbacks);
@@ -1113,6 +1055,7 @@ void check_for_exit(void) {
 	/* Exit */
 	char exit_message[] = "[Process terminated]\n";
 	write(fd_slave, exit_message, sizeof(exit_message));
+	close(input_buffer_semaphore[1]);
 }
 
 static int mouse_x = 0;
@@ -1127,14 +1070,32 @@ static int old_x = 0;
 static int old_y = 0;
 
 static void mouse_event(int button, int x, int y) {
-	char buf[7];
-	sprintf(buf, "\033[M%c%c%c", button + 32, x + 33, y + 33);
-	handle_input_s(buf);
+	if (ansi_state->mouse_on & TERMEMU_MOUSE_SGR) {
+		char buf[100];
+		sprintf(buf,"\033[<%d;%d;%d%c", button == 3 ? 0 : button, x+1, y+1, button == 3 ? 'm' : 'M');
+		handle_input_s(buf);
+	} else {
+		char buf[7];
+		sprintf(buf, "\033[M%c%c%c", button + 32, x + 33, y + 33);
+		handle_input_s(buf);
+	}
 }
 
 static void redraw_mouse(void) {
-	cell_redraw(old_x, old_y);
-	cell_redraw_inverted(mouse_x, mouse_y);
+	/* Redraw previous cursor position */
+	if (is_in_selection(old_x, old_y)) {
+		cell_redraw_inverted(old_x, old_y);
+	} else {
+		cell_redraw(old_x, old_y);
+	}
+	term_cell_t * cell = term_buffer + (mouse_y * term_width + mouse_x);
+	int current_background = cell->bg;
+	if (is_in_selection(mouse_x, mouse_y)) {
+		current_background = (((uint32_t *)cell)[0] == 0) ? TERM_DEFAULT_FG : cell->fg;
+	}
+	/* Get new cursor position character */
+	int cursor_color = (current_background == 12) ? 15 : 12;
+	term_write_char(L'▲', mouse_x, mouse_y, cursor_color, current_background, 0);
 	old_x = mouse_x;
 	old_y = mouse_y;
 }
@@ -1142,7 +1103,7 @@ static void redraw_mouse(void) {
 static unsigned int button_state = 0;
 
 void handle_mouse_event(mouse_device_packet_t * packet) {
-	if (ansi_state->mouse_on) {
+	if (ansi_state->mouse_on & TERMEMU_MOUSE_ENABLE) {
 		/* TODO: Handle shift */
 		if (packet->buttons & MOUSE_SCROLL_UP) {
 			mouse_event(32+32, mouse_x, mouse_y);
@@ -1158,7 +1119,7 @@ void handle_mouse_event(mouse_device_packet_t * packet) {
 			if (!(packet->buttons & MIDDLE_CLICK) && (button_state & MIDDLE_CLICK)) mouse_event(3, mouse_x, mouse_y);
 			if (!(packet->buttons & RIGHT_CLICK) && (button_state & MIDDLE_CLICK)) mouse_event(3, mouse_x, mouse_y);
 			button_state = packet->buttons;
-		} else if (ansi_state->mouse_on == 2) {
+		} else if (ansi_state->mouse_on & TERMEMU_MOUSE_DRAG) {
 			if (old_x != mouse_x || old_y != mouse_y) {
 				if (button_state & LEFT_CLICK) mouse_event(32, mouse_x, mouse_y);
 				if (button_state & MIDDLE_CLICK) mouse_event(33, mouse_x, mouse_y);
@@ -1279,6 +1240,11 @@ int main(int argc, char ** argv) {
 
 	reinit();
 
+	pthread_t input_buffer_thread;
+	pipe(input_buffer_semaphore);
+	input_buffer_queue = list_create();
+	pthread_create(&input_buffer_thread, NULL, handle_input_writing, NULL);
+
 	fflush(stdin);
 
 	system("cursor-off"); /* Might GPF */
@@ -1321,7 +1287,6 @@ int main(int argc, char ** argv) {
 
 		int kfd = open("/dev/kbd", O_RDONLY);
 		key_event_t event;
-		char c;
 		int vmmouse = 0;
 		mouse_device_packet_t packet;
 
@@ -1344,36 +1309,40 @@ int main(int argc, char ** argv) {
 
 		int fds[] = {fd_master, kfd, mfd, amfd};
 
-		unsigned char buf[1024];
+		#define BUF_SIZE 4096
+		unsigned char buf[4096];
 		while (!exit_application) {
 
-			int index = fswait2(amfd == -1 ? 3 : 4,fds,200);
+			int res[] = {0,0,0,0};
+			fswait3(amfd == -1 ? 3 : 4,fds,200,res);
 
 			check_for_exit();
 
 			if (input_stopped) continue;
 
-			if (index == 0) {
-				maybe_flip_cursor();
-				int r = read(fd_master, buf, 1024);
+			maybe_flip_cursor();
+			if (res[0]) {
+				int r = read(fd_master, buf, BUF_SIZE);
 				for (int i = 0; i < r; ++i) {
 					ansi_put(ansi_state, buf[i]);
 				}
-			} else if (index == 1) {
-				maybe_flip_cursor();
-				int r = read(kfd, &c, 1);
-				if (r > 0) {
-					int ret = kbd_scancode(&kbd_state, c, &event);
+			}
+			if (res[1]) {
+				int r = read(kfd, buf, BUF_SIZE);
+				for (int i = 0; i < r; ++i) {
+					int ret = kbd_scancode(&kbd_state, buf[i], &event);
 					key_event(ret, &event);
 				}
-			} else if (index == 2) {
+			}
+			if (res[2]) {
 				/* mouse event */
 				int r = read(mfd, (char *)&packet, sizeof(mouse_device_packet_t));
 				if (r > 0) {
 					last_mouse_buttons = packet.buttons;
 					handle_mouse(&packet);
 				}
-			} else if (amfd != -1 && index == 3) {
+			}
+			if (amfd != -1 && res[3]) {
 				int r = read(amfd, (char *)&packet, sizeof(mouse_device_packet_t));
 				if (r > 0) {
 					if (!vmmouse) {
@@ -1383,14 +1352,11 @@ int main(int argc, char ** argv) {
 					}
 					handle_mouse_abs(&packet);
 				}
-				continue;
-				
-			} else {
-				maybe_flip_cursor();
 			}
 		}
 
 	}
 
+	close(input_buffer_semaphore[1]);
 	return 0;
 }

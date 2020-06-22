@@ -94,6 +94,7 @@ static int height;
 static int widgets_width = 0;
 static int widgets_volume_enabled = 0;
 static int widgets_network_enabled = 0;
+static int widgets_weather_enabled = 0;
 
 static int network_status = 0;
 
@@ -112,6 +113,9 @@ struct MenuList * appmenu;
 struct MenuList * window_menu;
 struct MenuList * logout_menu;
 struct MenuList * netstat;
+struct MenuList * calmenu;
+struct MenuList * clockmenu;
+struct MenuList * weather;
 static yutani_wid_t _window_menu_wid = 0;
 
 static int _close_enough(struct yutani_msg_window_mouse_event * me) {
@@ -283,6 +287,106 @@ static void volume_lower(void) {
 	redraw();
 }
 
+static int weather_left = 0;
+static struct MenuEntry_Normal * weather_title_entry;
+static struct MenuEntry_Normal * weather_updated_entry;
+static struct MenuEntry_Normal * weather_conditions_entry;
+static struct MenuEntry_Normal * weather_humidity_entry;
+static struct MenuEntry_Normal * weather_clouds_entry;
+static char * weather_title_str;
+static char * weather_updated_str;
+static char * weather_conditions_str;
+static char * weather_humidity_str;
+static char * weather_clouds_str;
+static char * weather_temp_str;
+static int weather_status_valid = 0;
+static hashmap_t * weather_icons = NULL;
+static sprite_t * weather_icon = NULL;
+
+static void update_weather_status(void) {
+	FILE * f = fopen("/tmp/weather-parsed.conf","r");
+	if (!f) {
+		weather_status_valid = 0;
+		if (widgets_weather_enabled) {
+			widgets_weather_enabled = 0;
+			/* Unshow */
+			widgets_width -= 2*WIDGET_WIDTH;
+		}
+		return;
+	}
+
+	weather_status_valid = 1;
+	if (!widgets_weather_enabled) {
+		widgets_weather_enabled = 1;
+		widgets_width += 2*WIDGET_WIDTH;
+	}
+
+	if (weather_title_str) free(weather_title_str);
+	if (weather_updated_str) free(weather_updated_str);
+	if (weather_conditions_str) free(weather_conditions_str);
+	if (weather_humidity_str) free(weather_humidity_str);
+	if (weather_clouds_str) free(weather_clouds_str);
+	if (weather_temp_str) free(weather_temp_str);
+
+	/* read the entire status file */
+	fseek(f, 0, SEEK_END);
+	size_t size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	char * data = malloc(size + 1);
+	fread(data, size, 1, f);
+	data[size] = 0;
+	fclose(f);
+
+	/* Find relevant pieces */
+	char * t = data;
+	char * temp = t;
+	t = strstr(t, "\n"); *t = '\0'; t++;
+	char * temp_r = t;
+	t = strstr(t, "\n"); *t = '\0'; t++;
+	char * conditions = t;
+	t = strstr(t, "\n"); *t = '\0'; t++;
+	char * icon = t;
+	t = strstr(t, "\n"); *t = '\0'; t++;
+	char * humidity = t;
+	t = strstr(t, "\n"); *t = '\0'; t++;
+	char * clouds = t;
+	t = strstr(t, "\n"); *t = '\0'; t++;
+	char * city = t;
+	t = strstr(t, "\n"); *t = '\0'; t++;
+	char * updated = t;
+
+	if (!weather_icons) {
+		weather_icons = hashmap_create(10);
+	}
+
+	if (!hashmap_has(weather_icons, icon)) {
+		sprite_t * tmp = malloc(sizeof(sprite_t));
+		char path[512];
+		sprintf(path,"/usr/share/icons/weather/%s.png", icon);
+		load_sprite(tmp, path);
+		hashmap_set(weather_icons, icon, tmp);
+	}
+
+	weather_icon = hashmap_get(weather_icons, icon);
+
+	char tmp[300];
+	sprintf(tmp, "Weather for %s", city);
+	weather_title_str = strdup(tmp);
+	sprintf(tmp, "%s", updated);
+	weather_updated_str = strdup(tmp);
+	sprintf(tmp, "%s° - %s", temp, conditions);
+	weather_conditions_str = strdup(tmp);
+	sprintf(tmp, "Humidity: %s%%", humidity);
+	weather_humidity_str = strdup(tmp);
+	sprintf(tmp, "Clouds: %s%%", clouds);
+	weather_clouds_str = strdup(tmp);
+
+	sprintf(tmp, "%s°", temp_r);
+	weather_temp_str = strdup(tmp);
+
+	free(data);
+}
+
 static int netstat_left = 0;
 
 static struct MenuEntry_Normal * netstat_ip_entry;
@@ -384,6 +488,74 @@ static void show_app_menu(void) {
 	}
 }
 
+static void show_cal_menu(void) {
+	if (!calmenu->window) {
+		menu_show(calmenu, yctx);
+		if (calmenu->window) {
+			yutani_window_move(yctx, calmenu->window, width - 24 - calmenu->window->width, PANEL_HEIGHT);
+		}
+	}
+}
+
+static void show_clock_menu(void) {
+	if (!clockmenu->window) {
+		menu_show(clockmenu, yctx);
+		if (clockmenu->window) {
+			yutani_window_move(yctx, clockmenu->window, width - 24 - clockmenu->window->width, PANEL_HEIGHT);
+		}
+	}
+}
+
+static void weather_refresh(struct MenuEntry * self) {
+	(void)self;
+	system("weather-tool &");
+}
+
+static void weather_configure(struct MenuEntry * self) {
+	(void)self;
+	system("terminal sh -c \"sudo weather-configurator; weather-tool\" &");
+}
+
+static void show_weather_status(void) {
+	if (!weather) {
+		weather = menu_create();
+		weather_title_entry = (struct MenuEntry_Normal *)menu_create_normal(NULL, NULL, "", NULL);
+		menu_insert(weather, weather_title_entry);
+		weather_updated_entry = (struct MenuEntry_Normal *)menu_create_normal(NULL, NULL, "", NULL);
+		menu_insert(weather, weather_updated_entry);
+		menu_insert(weather, menu_create_separator());
+		weather_conditions_entry = (struct MenuEntry_Normal *)menu_create_normal(NULL, NULL, "", NULL);
+		menu_insert(weather, weather_conditions_entry);
+		weather_humidity_entry = (struct MenuEntry_Normal *)menu_create_normal(NULL, NULL, "", NULL);
+		menu_insert(weather, weather_humidity_entry);
+		weather_clouds_entry = (struct MenuEntry_Normal *)menu_create_normal(NULL, NULL, "", NULL);
+		menu_insert(weather, weather_clouds_entry);
+		menu_insert(weather, menu_create_separator());
+		menu_insert(weather, menu_create_normal("refresh", NULL, "Refresh...", weather_refresh));
+		menu_insert(weather, menu_create_normal("config", NULL, "Configure...", weather_configure));
+		menu_insert(weather, menu_create_separator());
+		menu_insert(weather, menu_create_normal(NULL, NULL, "Weather data provided by", NULL));
+		menu_insert(weather, menu_create_normal(NULL, NULL, "OpenWeatherMap.org", NULL));
+	}
+	if (weather_status_valid) {
+		menu_update_title(weather_title_entry, weather_title_str);
+		menu_update_title(weather_updated_entry, weather_updated_str);
+		menu_update_title(weather_conditions_entry, weather_conditions_str);
+		menu_update_title(weather_humidity_entry, weather_humidity_str);
+		menu_update_title(weather_clouds_entry, weather_clouds_str);
+	}
+	if (!weather->window) {
+		menu_show(weather, yctx);
+		if (weather->window) {
+			if (weather_left + weather->window->width > (unsigned int)width) {
+				yutani_window_move(yctx, weather->window, width - weather->window->width, PANEL_HEIGHT);
+			} else {
+				yutani_window_move(yctx, weather->window, weather_left, PANEL_HEIGHT);
+			}
+		}
+	}
+}
+
 static void show_network_status(void) {
 	if (!netstat) {
 		netstat = menu_create();
@@ -434,6 +606,10 @@ static void panel_check_click(struct yutani_msg_window_mouse_event * evt) {
 				show_logout_menu();
 			} else if (evt->new_x < APP_OFFSET) {
 				show_app_menu();
+			} else if (evt->new_x >= width - TIME_LEFT) {
+				show_clock_menu();
+			} else if (evt->new_x >= width - TIME_LEFT - DATE_WIDTH) {
+				show_cal_menu();
 			} else if (evt->new_x >= APP_OFFSET && evt->new_x < LEFT_BOUND) {
 				for (int i = 0; i < MAX_WINDOW_COUNT; ++i) {
 					if (ads_by_l[i] == NULL) break;
@@ -444,6 +620,13 @@ static void panel_check_click(struct yutani_msg_window_mouse_event * evt) {
 				}
 			}
 			int widget = 0;
+			if (widgets_weather_enabled) {
+				if (evt->new_x > WIDGET_POSITION(widget+1) && evt->new_x < WIDGET_POSITION(widget-1)) {
+					weather_left = WIDGET_POSITION(widget);
+					show_weather_status();
+				}
+				widget += 2;
+			}
 			if (widgets_network_enabled) {
 				if (evt->new_x > WIDGET_POSITION(widget) && evt->new_x < WIDGET_POSITION(widget-1)) {
 					netstat_left = WIDGET_POSITION(widget);
@@ -489,6 +672,12 @@ static void panel_check_click(struct yutani_msg_window_mouse_event * evt) {
 
 			if (scroll_direction) {
 				int widget = 0;
+				if (widgets_weather_enabled) {
+					if (evt->new_x > WIDGET_POSITION(widget+1) && evt->new_x < WIDGET_POSITION(widget-1)) {
+						/* Ignore */
+					}
+					widget += 2;
+				}
 				if (widgets_network_enabled) {
 					if (evt->new_x > WIDGET_POSITION(widget) && evt->new_x < WIDGET_POSITION(widget-1)) {
 						/* Ignore */
@@ -635,7 +824,7 @@ static void launch_application_menu(struct MenuEntry * self) {
 	struct MenuEntry_Normal * _self = (void *)self;
 
 	if (!strcmp((char *)_self->action,"log-out")) {
-		if (system("showdialog \"Log Out\" /usr/share/icons/48/exit.bmp \"Are you sure you want to log out?\"") == 0) {
+		if (system("showdialog \"Log Out\" /usr/share/icons/48/exit.png \"Are you sure you want to log out?\"") == 0) {
 			yutani_session_end(yctx);
 			_continue = 0;
 		}
@@ -808,26 +997,34 @@ static void redraw(void) {
 
 	/* Hours : Minutes : Seconds */
 	strftime(buffer, 80, "%H:%M:%S", timeinfo);
-	draw_sdf_string(ctx, width - TIME_LEFT, 3, buffer, 20, txt_color, SDF_FONT_THIN);
+	draw_sdf_string(ctx, width - TIME_LEFT, 3, buffer, 20, clockmenu->window ? HILIGHT_COLOR : txt_color, SDF_FONT_THIN);
 
 	/* Day-of-week */
 	strftime(buffer, 80, "%A", timeinfo);
 	t = draw_sdf_string_width(buffer, 12, SDF_FONT_THIN);
 	t = (DATE_WIDTH - t) / 2;
-	draw_sdf_string(ctx, width - TIME_LEFT - DATE_WIDTH + t, 2, buffer, 12, txt_color, SDF_FONT_THIN);
+	draw_sdf_string(ctx, width - TIME_LEFT - DATE_WIDTH + t, 2, buffer, 12, calmenu->window ? HILIGHT_COLOR : txt_color, SDF_FONT_THIN);
 
 	/* Month Day */
 	strftime(buffer, 80, "%h %e", timeinfo);
 	t = draw_sdf_string_width(buffer, 12, SDF_FONT_BOLD);
 	t = (DATE_WIDTH - t) / 2;
-	draw_sdf_string(ctx, width - TIME_LEFT - DATE_WIDTH + t, 12, buffer, 12, txt_color, SDF_FONT_BOLD);
+	draw_sdf_string(ctx, width - TIME_LEFT - DATE_WIDTH + t, 12, buffer, 12, calmenu->window ? HILIGHT_COLOR : txt_color, SDF_FONT_BOLD);
 
 	/* Applications menu */
 	draw_sdf_string(ctx, 8, 3, "Applications", 20, appmenu->window ? HILIGHT_COLOR : txt_color, SDF_FONT_THIN);
 
 	/* Draw each widget */
-	/* - Volume */
 	int widget = 0;
+	/* Weather */
+	if (widgets_weather_enabled) {
+		uint32_t color = (weather && weather->window) ? HILIGHT_COLOR : ICON_COLOR;
+		int t = draw_sdf_string_width(weather_temp_str, 15, SDF_FONT_THIN);
+		draw_sdf_string(ctx, WIDGET_POSITION(widget) + (WIDGET_WIDTH - t) / 2, 5, weather_temp_str, 15, color, SDF_FONT_THIN);
+		draw_sprite_alpha_paint(ctx, weather_icon, WIDGET_POSITION(widget+1), 0, 1.0, color);
+		widget += 2;
+	}
+	/* - Network */
 	if (widgets_network_enabled) {
 		uint32_t color = (netstat && netstat->window) ? HILIGHT_COLOR : ICON_COLOR;
 		if (network_status == 1) {
@@ -837,6 +1034,7 @@ static void redraw(void) {
 		}
 		widget++;
 	}
+	/* - Volume */
 	if (widgets_volume_enabled) {
 		if (volume_level < 10) {
 			draw_sprite_alpha_paint(ctx, sprite_volume_mute, WIDGET_POSITION(widget), 0, 1.0, ICON_COLOR);
@@ -1131,6 +1329,162 @@ static void sig_usr2(int sig) {
 	signal(SIGUSR2, sig_usr2);
 }
 
+static sprite_t * watchface = NULL;
+
+static void watch_draw_line(gfx_context_t * ctx, int offset, double r, double a, double b, uint32_t color, float thickness) {
+	double theta = (a / b) * 2.0 * M_PI;
+	draw_line_aa(ctx,
+		70 + 4,
+		70 + 4 + sin(theta) * r,
+		70 + offset,
+		70 + offset - cos(theta) * r, color, thickness);
+}
+
+void _menu_draw_MenuEntry_Clock(gfx_context_t * ctx, struct MenuEntry * self, int offset) {
+	self->offset = offset;
+
+	draw_sprite(ctx, watchface, 4, offset);
+
+	struct timeval now;
+	struct tm * timeinfo;
+	gettimeofday(&now, NULL);
+	timeinfo = localtime((time_t *)&now.tv_sec);
+
+	double sec = timeinfo->tm_sec + (double)now.tv_usec / 1000000.0;
+	double min = timeinfo->tm_min + sec / 60.0;
+	double hour = (timeinfo->tm_hour % 12) + min / 60.0;
+
+	watch_draw_line(ctx, offset, 40, hour, 12, rgb(0,0,0), 2.0);
+	watch_draw_line(ctx, offset, 60, min, 60, rgb(0,0,0), 1.5);
+	watch_draw_line(ctx, offset, 65, sec, 60, rgb(240,0,0), 1.0);
+
+}
+
+struct MenuEntry * menu_create_clock(void) {
+	struct MenuEntry * out = menu_create_separator(); /* Steal some defaults */
+
+	if (!watchface) {
+		watchface = malloc(sizeof(sprite_t));
+		load_sprite(watchface, "/usr/share/icons/watchface.png");
+	}
+
+	out->_type = -1; /* Special */
+	out->height = 140;
+	out->rwidth = 148;
+	out->renderer = _menu_draw_MenuEntry_Clock;
+	return out;
+}
+
+const char * month_names[] = {
+	"January",
+	"February",
+	"March",
+	"April",
+	"May",
+	"June",
+	"July",
+	"August",
+	"September",
+	"October",
+	"November",
+	"December",
+};
+
+int days_in_months[] = {
+	31, 0, 31, 30, 31, 30, 31,
+	31, 30, 31, 30, 31,
+};
+
+void _menu_draw_MenuEntry_Calendar(gfx_context_t * ctx, struct MenuEntry * self, int offset) {
+	self->offset = offset;
+
+	char lines[9][22];
+	memset(lines, 0, sizeof(lines));
+
+	struct timeval now;
+	gettimeofday(&now, NULL);
+
+	struct tm actual;
+	struct tm * timeinfo;
+	timeinfo = localtime((time_t *)&now.tv_sec);
+	memcpy(&actual, timeinfo, sizeof(struct tm));
+	timeinfo = &actual;
+
+	char month[20];
+	sprintf(month, "%s %d", month_names[timeinfo->tm_mon], timeinfo->tm_year + 1900);
+
+	int len = (20 - strlen(month)) / 2;
+	while (len > 0) {
+		strcat(lines[0]," ");
+		len--;
+	}
+	strcat(lines[0],month);
+
+	/* Days of week */
+	strcat(lines[1],"Su Mo Tu We Th Fr Sa");
+
+	int days_in_month = days_in_months[timeinfo->tm_mon];
+	if (days_in_month == 0) {
+		/* How many days in February? */
+		struct tm tmp;
+		memcpy(&tmp, timeinfo, sizeof(struct tm));
+		tmp.tm_mday = 29;
+		tmp.tm_hour = 12;
+		time_t tmp3 = mktime(&tmp);
+		struct tm * tmp2 = localtime(&tmp3);
+		if (tmp2->tm_mday == 29) {
+			days_in_month = 29;
+		} else {
+			days_in_month = 28;
+		}
+	}
+
+	int mday = timeinfo->tm_mday;
+	int wday = timeinfo->tm_wday; /* 0 == sunday */
+
+	while (mday > 1) {
+		mday--;
+		wday = (wday + 6) % 7;
+	}
+
+	for (int i = 0; i < wday; ++i) {
+		strcat(lines[2],"   ");
+	}
+
+	int line = 2;
+	while (mday <= days_in_month) {
+		/* TODO Bold text? */
+		char tmp[5];
+		sprintf(tmp, "%2d ", mday);
+		strcat(lines[line], tmp);
+		if (wday == 6) line++;
+		mday++;
+		wday = (wday + 1) % 7;
+	}
+
+	self->height = 16 * (line+1) + 8;
+
+	/* Go through each and draw with monospace font */
+	for (int i = 0; i < 9; ++i) {
+		if (lines[i][0] != 0) {
+			draw_sdf_string(ctx, 10, 4 + i * 17, lines[i], 16, rgb(0,0,0), i == 0 ? SDF_FONT_MONO_BOLD : SDF_FONT_MONO);
+		}
+	}
+}
+
+/*
+ * Special menu entry to display a calendar
+ */
+struct MenuEntry * menu_create_calendar(void) {
+	struct MenuEntry * out = menu_create_separator(); /* Steal some defaults */
+
+	out->_type = -1; /* Special */
+	out->height = 16 * 9 + 8;
+	out->rwidth = draw_sdf_string_width("XX XX XX XX XX XX XX", 16, SDF_FONT_MONO) + 20;
+	out->renderer = _menu_draw_MenuEntry_Calendar;
+	return out;
+}
+
 int main (int argc, char ** argv) {
 	if (argc < 2 || strcmp(argv[1],"--really")) {
 		fprintf(stderr,
@@ -1168,10 +1522,8 @@ int main (int argc, char ** argv) {
 	sprite_panel  = malloc(sizeof(sprite_t));
 	sprite_logout = malloc(sizeof(sprite_t));
 
-	load_sprite(sprite_panel,  "/usr/share/panel.bmp");
-	sprite_panel->alpha = ALPHA_EMBEDDED;
-	load_sprite(sprite_logout, "/usr/share/icons/panel-shutdown.bmp");
-	sprite_logout->alpha = ALPHA_FORCE_SLOW_EMBEDDED;
+	load_sprite(sprite_panel,  "/usr/share/panel.png");
+	load_sprite(sprite_logout, "/usr/share/icons/panel-shutdown.png");
 
 	struct stat stat_tmp;
 	if (!stat("/dev/dsp",&stat_tmp)) {
@@ -1181,14 +1533,10 @@ int main (int argc, char ** argv) {
 		sprite_volume_low  = malloc(sizeof(sprite_t));
 		sprite_volume_med  = malloc(sizeof(sprite_t));
 		sprite_volume_high = malloc(sizeof(sprite_t));
-		load_sprite(sprite_volume_mute, "/usr/share/icons/24/volume-mute.bmp");
-		sprite_volume_mute->alpha = ALPHA_FORCE_SLOW_EMBEDDED;
-		load_sprite(sprite_volume_low,  "/usr/share/icons/24/volume-low.bmp");
-		sprite_volume_low->alpha = ALPHA_FORCE_SLOW_EMBEDDED;
-		load_sprite(sprite_volume_med,  "/usr/share/icons/24/volume-medium.bmp");
-		sprite_volume_med->alpha = ALPHA_FORCE_SLOW_EMBEDDED;
-		load_sprite(sprite_volume_high, "/usr/share/icons/24/volume-full.bmp");
-		sprite_volume_high->alpha = ALPHA_FORCE_SLOW_EMBEDDED;
+		load_sprite(sprite_volume_mute, "/usr/share/icons/24/volume-mute.png");
+		load_sprite(sprite_volume_low,  "/usr/share/icons/24/volume-low.png");
+		load_sprite(sprite_volume_med,  "/usr/share/icons/24/volume-medium.png");
+		load_sprite(sprite_volume_high, "/usr/share/icons/24/volume-full.png");
 		/* XXX store current volume */
 	}
 
@@ -1196,12 +1544,13 @@ int main (int argc, char ** argv) {
 		widgets_network_enabled = 1;
 		widgets_width += WIDGET_WIDTH;
 		sprite_net_active = malloc(sizeof(sprite_t));
-		load_sprite(sprite_net_active, "/usr/share/icons/24/net-active.bmp");
-		sprite_net_active->alpha = ALPHA_FORCE_SLOW_EMBEDDED;
+		load_sprite(sprite_net_active, "/usr/share/icons/24/net-active.png");
 		sprite_net_disabled = malloc(sizeof(sprite_t));
-		load_sprite(sprite_net_disabled, "/usr/share/icons/24/net-disconnected.bmp");
-		sprite_net_disabled->alpha = ALPHA_FORCE_SLOW_EMBEDDED;
+		load_sprite(sprite_net_disabled, "/usr/share/icons/24/net-disconnected.png");
 	}
+
+	/* TODO Probably should use the app launch shortcut */
+	system("sh -c \"sleep 4; weather-tool\" &");
 
 	/* Draw the background */
 	for (int i = 0; i < width; i += sprite_panel->width) {
@@ -1218,6 +1567,12 @@ int main (int argc, char ** argv) {
 	signal(SIGUSR2, sig_usr2);
 
 	appmenu = menu_set_get_root(menu_set_from_description("/etc/panel.menu", launch_application_menu));
+
+	clockmenu = menu_create();
+	menu_insert(clockmenu, menu_create_clock());
+
+	calmenu = menu_create();
+	menu_insert(calmenu, menu_create_calendar());
 
 	window_menu = menu_create();
 	menu_insert(window_menu, menu_create_normal(NULL, NULL, "Maximize", _window_menu_start_maximize));
@@ -1243,7 +1598,11 @@ int main (int argc, char ** argv) {
 
 	while (_continue) {
 
-		int index = fswait2(1,fds,200);
+		int index = fswait2(1,fds,clockmenu->window ? 50 : 200);
+
+		if (clockmenu->window) {
+			menu_force_redraw(clockmenu);
+		}
 
 		if (index == 0) {
 			/* Respond to Yutani events */
@@ -1290,6 +1649,7 @@ int main (int argc, char ** argv) {
 				waitpid(-1, NULL, WNOHANG);
 				update_volume_level();
 				update_network_status();
+				update_weather_status();
 				redraw();
 			}
 		}
